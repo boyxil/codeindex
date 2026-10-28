@@ -1,16 +1,28 @@
 //! codeindex library: parse Rust sources into a symbol inventory.
-//! M0 scope: walk + parse + extract. Storage (SQLite) lands in M1,
-//! name resolution (stack-graphs) in M3.
+//!
+//! Entirely self-contained: a hand-written lexer (see [`lexer`]) feeds a
+//! token-level item scanner. No tree-sitter, no external grammars — the
+//! whole pipeline is ours to extend. The cost is honest imprecision:
+//! name resolution is heuristic until the M3 resolver lands, which is
+//! why edges (M2+) will carry resolved/candidate tiers rather than
+//! pretending to certainty.
+//!
+//! M0 scope: walk + lex + extract item declarations.
+//! M1 adds SQLite storage and incremental rescans;
+//! M2 adds queries and lexical call-site candidates;
+//! M3 adds the in-house name resolver (use-tree + module tree).
+
+pub mod lexer;
 
 use anyhow::Context;
-use streaming_iterator::StreamingIterator;
+use lexer::{lex, text, Tok};
 use std::path::{Path, PathBuf};
 
 /// One extracted symbol.
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub name: String,
-    /// fn | struct | enum | trait | impl
+    /// fn | struct | enum | trait | impl | mod | union
     pub kind: &'static str,
     pub file: PathBuf,
     /// 1-based line of the item's start.
@@ -46,84 +58,168 @@ impl Inventory {
     pub fn impl_count(&self) -> usize {
         self.count("impl")
     }
+    pub fn mod_count(&self) -> usize {
+        self.count("mod")
+    }
+    pub fn union_count(&self) -> usize {
+        self.count("union")
+    }
 }
 
-/// tree-sitter query: every item kind we index, name captured as `name`.
-/// One pattern per impl — a trait arm too would match `impl Trait for
-/// Type` twice (the query language has no comments, hence the docs
-/// live here).
-const ITEMS_QUERY: &str = r#"
-(function_item name: (identifier) @name)
-(struct_item    name: (type_identifier) @name)
-(enum_item      name: (type_identifier) @name)
-(trait_item     name: (type_identifier) @name)
-(impl_item      type: (type_identifier) @name)
-"#;
+/// Item keywords we index, with the extraction rule per keyword.
+const ITEM_KEYWORDS: &[(&str, ItemKind)] = &[
+    ("fn", ItemKind::Named),
+    ("struct", ItemKind::Named),
+    ("enum", ItemKind::Named),
+    ("trait", ItemKind::Named),
+    ("mod", ItemKind::Named),
+    ("union", ItemKind::Named),
+    ("impl", ItemKind::Impl),
+];
+
+#[derive(Clone, Copy)]
+enum ItemKind {
+    /// `keyword Name …` — the name is the next Ident.
+    Named,
+    /// `impl … { }` — the name is the last Ident before the brace
+    /// (the implemented type; the trait, if any, precedes `for`).
+    Impl,
+}
 
 /// Walk `root` for *.rs files (skipping target/, .git/, .codeindex/),
-/// parse each with tree-sitter, collect symbols.
+/// lex each file, extract item declarations.
 pub fn scan(root: &Path) -> anyhow::Result<Inventory> {
-    let mut language = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE.into());
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&mut language)
-        .context("loading Rust grammar")?;
-    let query = tree_sitter::Query::new(&language, ITEMS_QUERY).context("items query")?;
-
     let mut inv = Inventory::default();
-    for entry in walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !(e.depth() > 0
-                && (name == "target" || name == ".git" || name == ".codeindex"))
-        })
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "rs"))
-    {
-        let file = entry.path();
-        let src = std::fs::read(file)
+    for file in rust_files(root) {
+        let src = std::fs::read_to_string(&file)
             .with_context(|| format!("reading {}", file.display()))?;
-        let tree = parser
-            .parse(&src, None)
-            .context(format!("parsing {}", file.display()))?;
         inv.files += 1;
-
-        let mut cursor = tree_sitter::QueryCursor::new();
-        // tree-sitter 0.24 exposes matches as a StreamingIterator: the C
-        // cursor state mutates per step, so `while let Some(m) = it.next()`
-        // is the sanctioned shape (Item = &mut QueryMatch).
-        let mut matches = cursor.matches(&query, tree.root_node(), src.as_slice());
-        while let Some(m) = matches.next() {
-            let Some(name_node) = m.captures.first() else {
-                continue;
-            };
-            let name = name_node
-                .node
-                .utf8_text(&src)
-                .unwrap_or_default()
-                .to_string();
-            let kind = match m.pattern_index {
-                0 => "fn",
-                1 => "struct",
-                2 => "enum",
-                3 => "trait",
-                _ => "impl",
-            };
-            inv.symbols.push(Symbol {
-                name,
-                kind,
-                file: file.to_path_buf(),
-                line: name_node.node.start_position().row + 1,
-            });
-        }
+        extract_items(&lex(&src), &src, &file, &mut inv.symbols);
     }
     Ok(inv)
+}
+
+/// Collect *.rs files without following skipped directories.
+fn rust_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                if name != "target" && name != ".git" && name != ".codeindex" {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Token-level item extraction. A keyword opens an item when it is not
+/// in method-call position (preceded by `.`); a `fn` inside a type like
+/// `Box<fn(u8) -> u8>` is skipped because no Ident follows the keyword.
+fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<Symbol>) {
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if tok.kind != Tok::Ident {
+            i += 1;
+            continue;
+        }
+        let word = text(src, tok);
+        let Some((kw, kind)) = ITEM_KEYWORDS.iter().find(|(kw, _)| *kw == word) else {
+            i += 1;
+            continue;
+        };
+        // Method-call position guard: `.fn()` cannot occur (reserved),
+        // but a path segment `Foo::fn` cannot either — the real hazard is
+        // a field access like `x.union`, so skip after `.`.
+        if i > 0 && tokens[i - 1].kind == Tok::Punct
+            && text(src, &tokens[i - 1]) == "."
+        {
+            i += 1;
+            continue;
+        }
+
+        match kind {
+            ItemKind::Named => {
+                let Some(next) = tokens.get(i + 1) else {
+                    i += 1;
+                    continue;
+                };
+                if next.kind != Tok::Ident {
+                    i += 1; // e.g. `fn(` in a fn-pointer type — not an item
+                    continue;
+                }
+                out.push(Symbol {
+                    name: text(src, next).to_string(),
+                    kind: kw,
+                    file: file.to_path_buf(),
+                    line: tok.line,
+                });
+            }
+            ItemKind::Impl => {
+                // Scan to the opening brace at angle/paren depth 0; the
+                // implemented type is the last Ident before it.
+                let mut depth = 0i32;
+                let mut last_ident: Option<&lexer::Token> = None;
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < tokens.len() {
+                    let t = &tokens[j];
+                    match t.kind {
+                        Tok::Punct => match text(src, t) {
+                            "<" => depth += 1,
+                            ">" => depth -= 1,
+                            "(" => depth += 1,
+                            ")" => depth -= 1,
+                            "{" if depth <= 0 => {
+                                closed = true;
+                                break;
+                            }
+                            _ => {}
+                        },
+                        Tok::Ident => last_ident = Some(t),
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if closed {
+                    if let Some(t) = last_ident {
+                        out.push(Symbol {
+                            name: text(src, t).to_string(),
+                            kind: "impl",
+                            file: file.to_path_buf(),
+                            line: tok.line,
+                        });
+                    }
+                    i = j; // resume inside the impl body
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn symbols(src: &str) -> Vec<(String, &'static str)> {
+        let toks = lex(src);
+        let mut out = Vec::new();
+        extract_items(&toks, src, Path::new("t.rs"), &mut out);
+        out.into_iter().map(|s| (s.name, s.kind)).collect()
+    }
 
     #[test]
     fn scan_extracts_symbols_from_a_sample_tree() {
@@ -144,6 +240,9 @@ mod tests {
         assert_eq!(inv.impl_count(), 1);
         assert_eq!(inv.symbols[0].name, "alpha");
         assert_eq!(inv.symbols[0].line, 1);
+        // `impl Trait for Type` names the TYPE.
+        let imp = inv.symbols.iter().find(|s| s.kind == "impl").unwrap();
+        assert_eq!(imp.name, "Beta");
     }
 
     #[test]
@@ -157,5 +256,48 @@ mod tests {
         assert_eq!(inv.files, 1);
         assert_eq!(inv.total(), 1);
         assert_eq!(inv.symbols[0].name, "yes");
+    }
+
+    #[test]
+    fn fn_pointers_in_types_are_not_items() {
+        let syms = symbols("let f: Box<fn(u8) -> u8> = None;\nfn real() {}\n");
+        assert_eq!(syms, vec![("real".into(), "fn")]);
+    }
+
+    #[test]
+    fn generics_and_where_clauses_keep_the_name() {
+        let syms = symbols(
+            "fn generic<T: Clone>(t: T) -> T where T: Send { t }\nstruct Pair<A, B> { a: A, b: B }\n",
+        );
+        assert_eq!(
+            syms,
+            vec![("generic".into(), "fn"), ("Pair".into(), "struct")]
+        );
+    }
+
+    #[test]
+    fn mod_union_impl_types_are_indexed() {
+        let syms = symbols(
+            "mod inner;\nunion U { a: u32 }\nimpl std::fmt::Display for Wrapper {}\nimpl Config {}\n",
+        );
+        assert!(syms.contains(&("inner".into(), "mod")));
+        assert!(syms.contains(&("U".into(), "union")));
+        // `impl std::fmt::Display for Wrapper` — the type is Wrapper; the
+        // impl body scan must survive the `::` path segments.
+        assert!(syms.contains(&("Wrapper".into(), "impl")));
+        assert!(syms.contains(&("Config".into(), "impl")));
+    }
+
+    #[test]
+    fn keyword_after_dot_is_a_field_not_an_item() {
+        let syms = symbols("let x = parser.union;\nfn ok() {}\n");
+        assert_eq!(syms, vec![("ok".into(), "fn")]);
+    }
+
+    #[test]
+    fn items_inside_fn_bodies_are_indexed_too() {
+        let syms = symbols("fn outer() {\n    fn helper() {}\n    struct Inner;\n}\n");
+        let names: Vec<&str> = syms.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["outer", "helper", "Inner"]);
     }
 }

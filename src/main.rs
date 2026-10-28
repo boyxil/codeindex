@@ -1,7 +1,8 @@
 //! codeindex — local code index for AI agents.
-//! M0: walk a Rust tree, parse every file with tree-sitter, report symbols.
+//! M0: walk a Rust tree, lex every file with the in-house lexer,
+//! report the symbol inventory.
 
-use anyhow::Context;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -21,23 +22,31 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Scan { path } => {
             let inv = codeindex::scan(&path)?;
             println!(
-                "{} files parsed, {} symbols: {} fn, {} struct, {} enum, {} trait, {} impl",
-                inv.files, inv.total(), inv.fn_count(), inv.struct_count(), inv.enum_count(),
-                inv.trait_count(), inv.impl_count()
+                "{} files parsed, {} symbols: {} fn, {} struct, {} enum, {} trait, {} impl, {} mod, {} union",
+                inv.files,
+                inv.total(),
+                inv.fn_count(),
+                inv.struct_count(),
+                inv.enum_count(),
+                inv.trait_count(),
+                inv.impl_count(),
+                inv.mod_count(),
+                inv.union_count()
             );
             for sym in inv.symbols.iter().take(20) {
                 println!(
-                    "  {:>8} {}",
+                    "  {:>7} {}:{}",
                     sym.kind,
-                    format!("{}:{}", sym.file.display(), sym.line)
+                    sym.file.display(),
+                    sym.line
                 );
-                println!("           {}", sym.name);
+                println!("          {}", sym.name);
             }
             if inv.symbols.len() > 20 {
                 println!("  … and {} more", inv.symbols.len() - 20);
