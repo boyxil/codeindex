@@ -1,0 +1,23 @@
+[package]
+name = "codeindex"
+version = "0.1.0"
+edition = "2021"
+description = "Local code index for AI agents: symbols, call edges, references — tree-sitter + stack-graphs, MCP-served"
+license = "Apache-2.0"
+repository = "https://github.com/boyxil/codeindex"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+streaming-iterator = "0.1"
+
+# Parsing + name resolution (M1+): tree-sitter parses, stack-graphs resolves
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+
+[dev-dependencies]
+tempfile = "3"

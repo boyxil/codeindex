@@ -1,0 +1,31 @@
+# codeindex — рабочий стол проекта
+
+Свой индекс кода для ИИ-агентов (Rust-only v1): tree-sitter + stack-graphs,
+хранилище SQLite, MCP-поверхность. Мотивация и полный план — в PLAN.md.
+
+## Запуск и тесты
+
+```bash
+PATH="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"
+cargo test                      # юнит-тесты на фикстурах
+cargo run -- scan <путь>        # M0: инвентарь символов
+# M1+: cargo run -- index <путь> && cargo run -- search <query>
+```
+
+## Состояние (обновлять после каждой вехи!)
+
+- **M0 готов** (2026-10-28): сканер символов работает, 2/2 теста,
+  само-сканирование ок. Коммит: см. git log.
+- Следующая веха: **M1** — SQLite-хранилище + инкрементальный
+  `index <path>` (схема: files(path, hash, mtime), symbols(file_id,
+  name, kind, line), edges — в M2/M3, meta(schema_version)).
+- После M1: та же верификация + само-индексация этого репо.
+
+## Важно
+
+- Не уходить от честных пометок рёбер (resolved/candidate/unresolved) —
+  это принцип проекта, не деталь.
+- tree-sitter 0.24: matches — StreamingIterator (`while let Some(m) =
+  it.next()`, крейт streaming-iterator), std-Iterator нет; в строке
+  запроса комментарии не поддерживаются.
+- Русские пояснения — сюда и в PLAN.md; код и комментарии — английские.
