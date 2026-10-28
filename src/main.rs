@@ -2,11 +2,13 @@
 //! M0: walk a Rust tree, lex every file with the in-house lexer,
 //! report the symbol inventory.
 //! M1: incremental SQLite index at <path>/.codeindex/index.db.
-//! M2: queries over the store — search, definition, candidate callers.
+//! M2: queries over the store — search, definition, callers.
+//! M3: in-house name resolver — resolved edges, call_tree, blast_radius.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use codeindex::query::CallNode;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "codeindex", version, about = "Local code index for AI agents")]
@@ -42,14 +44,35 @@ enum Command {
         /// Exact symbol name.
         name: String,
     },
-    /// List call sites invoking this name (candidate tier until the
-    /// M3 resolver confirms them).
+    /// List call sites invoking this name, with their resolution tier.
     Callers {
         /// Indexed repository root.
         path: PathBuf,
         /// Exact callee name.
         name: String,
     },
+    /// Show who calls this symbol, transitively (resolved edges only).
+    CallTree {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact symbol name.
+        name: String,
+        /// Maximum caller depth.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
+    /// List everything that transitively calls this symbol — what a
+    /// change here can reach.
+    BlastRadius {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact symbol name.
+        name: String,
+    },
+}
+
+fn open(path: &Path) -> Result<codeindex::store::Store> {
+    codeindex::store::Store::open(&path.join(".codeindex/index.db"))
 }
 
 fn main() -> Result<()> {
@@ -85,16 +108,20 @@ fn main() -> Result<()> {
         Command::Index { path } => {
             let stats = codeindex::index(&path)?;
             println!(
-                "{} files seen: {} parsed, {} unchanged, {} removed — {} symbols total",
+                "{} files seen: {} parsed, {} unchanged, {} removed — {} symbols, {} edges ({} resolved, {} candidate, {} unresolved)",
                 stats.files_seen,
                 stats.parsed,
                 stats.unchanged,
                 stats.removed,
-                stats.symbols
+                stats.symbols,
+                stats.edges,
+                stats.resolved,
+                stats.candidate,
+                stats.unresolved
             );
         }
         Command::Search { path, query } => {
-            let store = codeindex::store::Store::open(&path.join(".codeindex/index.db"))?;
+            let store = open(&path)?;
             let hits = store.search_symbols(&query)?;
             println!("{} matches for \"{}\":", hits.len(), query);
             for s in &hits {
@@ -102,25 +129,64 @@ fn main() -> Result<()> {
             }
         }
         Command::Definition { path, name } => {
-            let store = codeindex::store::Store::open(&path.join(".codeindex/index.db"))?;
+            let store = open(&path)?;
             let defs = store.definitions(&name)?;
             match defs.len() {
                 0 => println!("no symbol named \"{name}\""),
                 1 => println!("1 definition:"),
-                n => println!("{n} definitions (the resolver will disambiguate in M3):"),
+                n => println!("{n} definitions (same name in several places):"),
             }
             for s in &defs {
                 println!("  {:>7} {} {}:{}", s.kind, s.name, s.file, s.line);
             }
         }
         Command::Callers { path, name } => {
-            let store = codeindex::store::Store::open(&path.join(".codeindex/index.db"))?;
+            let store = open(&path)?;
             let refs = store.callers(&name)?;
             println!("{} call site(s) of \"{name}\":", refs.len());
             for r in &refs {
-                println!("  {}:{} ({})", r.file, r.line, r.tier);
+                match (&r.target, &r.reason) {
+                    (Some((f, l)), _) => {
+                        println!("  {}:{} ({}) → {}:{}", r.file, r.line, r.tier, f, l)
+                    }
+                    (None, Some(reason)) => {
+                        println!("  {}:{} ({}, {})", r.file, r.line, r.tier, reason)
+                    }
+                    _ => println!("  {}:{} ({})", r.file, r.line, r.tier),
+                }
+            }
+        }
+        Command::CallTree { path, name, depth } => {
+            let store = open(&path)?;
+            let tree = codeindex::query::call_tree(&store, &name, depth)?;
+            if tree.is_empty() {
+                println!("no symbol named \"{name}\"");
+            } else {
+                println!("callers of \"{name}\" (resolved edges only):");
+                print_tree(&tree, 1);
+            }
+        }
+        Command::BlastRadius { path, name } => {
+            let store = open(&path)?;
+            let affected = codeindex::query::blast_radius(&store, &name)?;
+            let files: std::collections::HashSet<&str> =
+                affected.iter().map(|a| a.file.as_str()).collect();
+            println!(
+                "{} transitive call site(s) of \"{name}\" across {} file(s):",
+                affected.len(),
+                files.len()
+            );
+            for a in &affected {
+                println!("  d{} {}:{}", a.depth, a.file, a.line);
             }
         }
     }
     Ok(())
+}
+
+fn print_tree(nodes: &[CallNode], indent: usize) {
+    for node in nodes {
+        println!("{}{}:{}", "  ".repeat(indent), node.file, node.line);
+        print_tree(&node.children, indent + 1);
+    }
 }

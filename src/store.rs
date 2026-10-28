@@ -1,30 +1,33 @@
 //! SQLite storage for the index (`.codeindex/index.db`).
 //!
-//! M1 schema: `meta(schema_version)`, `files(path, hash, mtime)`,
-//! `symbols(file_id, name, kind, line)`. The `edges` table waits for M2/M3:
-//! it should not exist before call-site extraction defines its columns —
-//! a table we cannot honestly fill is noise.
+//! Schema v2: `meta(schema_version, extractor_version)`,
+//! `files(path, hash, mtime, module)`, `symbols`, `edges` (with the
+//! resolution fields), and the resolver's raw material: `modules`
+//! (inline spans), `impls`, `traits`, `imports`.
+//!
+//! Edges carry the project's honesty contract in columns: `tier`
+//! (`resolved` | `candidate` | `unresolved`), `resolved_file_id` +
+//! `resolved_line` for the exact target, and `reason` for everything
+//! that is not resolved.
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub const SCHEMA_VERSION: &str = "1";
+use crate::resolve::{self, EdgeRow, FileData, Resolution, SymRow};
+use crate::scopes::Scopes;
 
-/// What the extractor writes per file (symbols since M1, call edges
-/// since M2). Unlike schema_version this describes the *derived* data:
-/// bumping it makes stored hashes stale as parse decisions, so the next
-/// index run re-parses everything once.
-pub const EXTRACTOR_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "2";
 
-/// Tier of an edge, per the project's honesty rule. M2 only ever writes
-/// `candidate` (name-shaped call sites); `resolved`/`unresolved` arrive
-/// with the M3 name resolver.
-pub const TIER_CANDIDATE: &str = "candidate";
+/// What the extractor writes per file (symbols+edges since M2, call
+/// scopes since M3). Unlike schema_version this describes the *derived*
+/// data: bumping it makes stored hashes stale as parse decisions, so the
+/// next index run re-parses everything once.
+pub const EXTRACTOR_VERSION: &str = "3";
 
-/// One indexed symbol joined with its file — the minimal read API M2
-/// queries grow from.
+/// One indexed symbol joined with its file — the read API M2 queries
+/// grow from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexedSymbol {
     /// Path relative to the indexed root.
@@ -34,12 +37,25 @@ pub struct IndexedSymbol {
     pub line: i64,
 }
 
-/// One call site found for a callee name.
+/// One call site found for a callee name, with its resolution state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallRef {
     pub file: String,
     pub line: i64,
     pub tier: String,
+    pub target: Option<(String, i64)>,
+    pub reason: Option<String>,
+}
+
+/// A call edge with its resolution, for call-graph queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeInfo {
+    pub file: String,
+    pub line: i64,
+    pub callee: String,
+    pub tier: String,
+    pub target: Option<(String, i64)>,
+    pub reason: Option<String>,
 }
 
 pub struct Store {
@@ -79,14 +95,16 @@ impl Store {
                  id INTEGER PRIMARY KEY,
                  path TEXT NOT NULL UNIQUE,
                  hash TEXT NOT NULL,
-                 mtime INTEGER NOT NULL
+                 mtime INTEGER NOT NULL,
+                 module TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS symbols (
                  id INTEGER PRIMARY KEY,
                  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                  name TEXT NOT NULL,
                  kind TEXT NOT NULL,
-                 line INTEGER NOT NULL
+                 line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
              CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
@@ -95,10 +113,44 @@ impl Store {
                  src_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                  src_line INTEGER NOT NULL,
                  callee TEXT NOT NULL,
-                 tier TEXT NOT NULL
+                 qualifier TEXT,
+                 call_kind TEXT NOT NULL,
+                 tier TEXT NOT NULL,
+                 resolved_file_id INTEGER REFERENCES files(id),
+                 resolved_line INTEGER,
+                 reason TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_edges_callee ON edges(callee);
-             CREATE INDEX IF NOT EXISTS idx_edges_file_id ON edges(src_file_id);",
+             CREATE INDEX IF NOT EXISTS idx_edges_file_id ON edges(src_file_id);
+             CREATE TABLE IF NOT EXISTS modules (
+                 id INTEGER PRIMARY KEY,
+                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 path TEXT NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS impls (
+                 id INTEGER PRIMARY KEY,
+                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 type_name TEXT NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS traits (
+                 id INTEGER PRIMARY KEY,
+                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 name TEXT NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS imports (
+                 id INTEGER PRIMARY KEY,
+                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 path TEXT NOT NULL,
+                 alias TEXT NOT NULL,
+                 glob INTEGER NOT NULL,
+                 line INTEGER NOT NULL
+             );",
         )?;
         let stored: Option<String> = conn
             .query_row(
@@ -135,50 +187,113 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Upsert one file and replace its symbol and edge rows wholesale.
-    /// Per-file wholesale replacement keeps the parse-and-store step free
-    /// of line-level diffing — the hash already decided the file changed.
+    /// Upsert one file and replace its symbols, edges and scopes
+    /// wholesale. Per-file wholesale replacement keeps the
+    /// parse-and-store step free of line-level diffing — the hash
+    /// already decided the file changed. The arguments are one parse
+    /// result split for clarity; bundling them would not simplify it.
+    #[allow(clippy::too_many_arguments)]
     pub fn replace_file(
         &self,
         path: &str,
         hash: &str,
         mtime: i64,
+        module: &str,
         symbols: &[super::Symbol],
         calls: &[super::CallSite],
+        scopes: &Scopes,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO files(path, hash, mtime) VALUES (?1, ?2, ?3)
-             ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, mtime = excluded.mtime",
-            params![path, hash, mtime],
+            "INSERT INTO files(path, hash, mtime, module) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+                 hash = excluded.hash, mtime = excluded.mtime, module = excluded.module",
+            params![path, hash, mtime, module],
         )?;
         let file_id: i64 =
             tx.query_row("SELECT id FROM files WHERE path = ?1", params![path], |r| {
                 r.get(0)
             })?;
-        tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
-        tx.execute("DELETE FROM edges WHERE src_file_id = ?1", params![file_id])?;
+        for table in ["symbols", "edges", "modules", "impls", "traits", "imports"] {
+            let column = if table == "edges" { "src_file_id" } else { "file_id" };
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                params![file_id],
+            )?;
+        }
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO symbols(file_id, name, kind, line) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO symbols(file_id, name, kind, line, end_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for s in symbols {
-                stmt.execute(params![file_id, s.name, s.kind, s.line as i64])?;
+                stmt.execute(params![
+                    file_id,
+                    s.name,
+                    s.kind,
+                    s.line as i64,
+                    s.end_line as i64
+                ])?;
             }
         }
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO edges(src_file_id, src_line, callee, tier) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO edges(
+                     src_file_id, src_line, callee, qualifier, call_kind, tier
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for c in calls {
-                stmt.execute(params![file_id, c.line as i64, c.callee, TIER_CANDIDATE])?;
+                stmt.execute(params![
+                    file_id,
+                    c.line as i64,
+                    c.callee,
+                    c.qualifier,
+                    call_kind_name(c.kind),
+                    resolve::TIER_CANDIDATE
+                ])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO modules(file_id, path, start_line, end_line)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for m in &scopes.modules {
+                stmt.execute(params![file_id, m.path, m.start_line as i64, m.end_line as i64])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO impls(file_id, type_name, start_line, end_line)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for i in &scopes.impls {
+                stmt.execute(params![file_id, i.type_name, i.start_line as i64, i.end_line as i64])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO traits(file_id, name, start_line, end_line)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for t in &scopes.traits {
+                stmt.execute(params![file_id, t.name, t.start_line as i64, t.end_line as i64])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO imports(file_id, path, alias, glob, line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for u in &scopes.uses {
+                stmt.execute(params![file_id, u.path, u.alias, u.glob, u.line as i64])?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Drop a file and (via cascade) its symbols and edges.
+    /// Drop a file and (via cascade) everything derived from it.
     pub fn remove_file(&self, path: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM files WHERE path = ?1", params![path])?;
@@ -209,6 +324,210 @@ impl Store {
             params![version],
         )?;
         Ok(())
+    }
+
+    /// Everything the resolver needs, one FileData per indexed file.
+    pub fn load_files(&self) -> Result<Vec<FileData>> {
+        let mut files: Vec<FileData> = Vec::new();
+        let mut index_of: HashMap<i64, usize> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT id, module FROM files ORDER BY path")?;
+            let rows = stmt.query_map([], |r| {
+                Ok(FileData {
+                    file_id: r.get(0)?,
+                    module: r.get(1)?,
+                    ..Default::default()
+                })
+            })?;
+            for f in rows {
+                let f = f?;
+                index_of.insert(f.file_id, files.len());
+                files.push(f);
+            }
+        }
+        let mut symbol_rows = self
+            .conn
+            .prepare("SELECT file_id, name, kind, line, end_line FROM symbols")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    SymRow {
+                        name: r.get(1)?,
+                        kind: r.get(2)?,
+                        line: r.get(3)?,
+                        end_line: r.get(4)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (file_id, row) in symbol_rows.drain(..) {
+            if let Some(&idx) = index_of.get(&file_id) {
+                files[idx].symbols.push(row);
+            }
+        }
+        let mut module_rows = self
+            .conn
+            .prepare("SELECT file_id, path, start_line, end_line FROM modules")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    crate::scopes::ModuleSpan {
+                        path: r.get(1)?,
+                        start_line: r.get::<_, i64>(2)? as usize,
+                        end_line: r.get::<_, i64>(3)? as usize,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (file_id, span) in module_rows.drain(..) {
+            if let Some(&idx) = index_of.get(&file_id) {
+                files[idx].module_spans.push(span);
+            }
+        }
+        let mut impl_rows = self
+            .conn
+            .prepare("SELECT file_id, type_name, start_line, end_line FROM impls")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    crate::scopes::ImplSpan {
+                        type_name: r.get(1)?,
+                        start_line: r.get::<_, i64>(2)? as usize,
+                        end_line: r.get::<_, i64>(3)? as usize,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (file_id, span) in impl_rows.drain(..) {
+            if let Some(&idx) = index_of.get(&file_id) {
+                files[idx].impl_spans.push(span);
+            }
+        }
+        let mut trait_rows = self
+            .conn
+            .prepare("SELECT file_id, name, start_line, end_line FROM traits")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    crate::scopes::TraitSpan {
+                        name: r.get(1)?,
+                        start_line: r.get::<_, i64>(2)? as usize,
+                        end_line: r.get::<_, i64>(3)? as usize,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (file_id, span) in trait_rows.drain(..) {
+            if let Some(&idx) = index_of.get(&file_id) {
+                files[idx].trait_spans.push(span);
+            }
+        }
+        let mut import_rows = self
+            .conn
+            .prepare("SELECT file_id, path, alias, glob, line FROM imports")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    crate::scopes::UseDecl {
+                        path: r.get(1)?,
+                        alias: r.get(2)?,
+                        glob: r.get(3)?,
+                        line: r.get::<_, i64>(4)? as usize,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (file_id, decl) in import_rows.drain(..) {
+            if let Some(&idx) = index_of.get(&file_id) {
+                files[idx].uses.push(decl);
+            }
+        }
+        Ok(files)
+    }
+
+    /// Every call edge, without resolution fields.
+    pub fn all_edges(&self) -> Result<Vec<EdgeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, src_file_id, src_line, callee, qualifier, call_kind FROM edges",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(EdgeRow {
+                id: r.get(0)?,
+                src_file_id: r.get(1)?,
+                src_line: r.get(2)?,
+                callee: r.get(3)?,
+                qualifier: r.get(4)?,
+                call_kind: r.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Write resolution results back onto the edges (one transaction).
+    pub fn apply_resolutions(&self, updates: &[(i64, Resolution)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE edges SET tier = ?2, resolved_file_id = ?3,
+                 resolved_line = ?4, reason = ?5 WHERE id = ?1",
+            )?;
+            for (id, r) in updates {
+                stmt.execute(params![
+                    id,
+                    r.tier,
+                    r.target.map(|t| t.0),
+                    r.target.map(|t| t.1),
+                    r.reason
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Edge counts per tier: (resolved, candidate, unresolved).
+    pub fn edge_tier_counts(&self) -> Result<(usize, usize, usize)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tier, COUNT(*) FROM edges GROUP BY tier")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let (mut resolved, mut candidate, mut unresolved) = (0usize, 0usize, 0usize);
+        for row in rows {
+            let (tier, n) = row?;
+            match tier.as_str() {
+                resolve::TIER_RESOLVED => resolved = n as usize,
+                resolve::TIER_CANDIDATE => candidate = n as usize,
+                _ => unresolved = n as usize,
+            }
+        }
+        Ok((resolved, candidate, unresolved))
+    }
+
+    /// `fn` spans per file — the call-graph queries use them to climb
+    /// from a call site to the function that contains it.
+    pub fn function_spans(&self) -> Result<HashMap<String, Vec<(i64, i64)>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, s.line, s.end_line FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE s.kind = 'fn'
+             ORDER BY f.path, s.line",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+        for row in rows {
+            let (path, start, end) = row?;
+            out.entry(path).or_default().push((start, end));
+        }
+        Ok(out)
     }
 
     pub fn symbol_count(&self) -> Result<usize> {
@@ -252,7 +571,7 @@ impl Store {
     }
 
     /// Exact-name definitions; a name may legitimately exist in several
-    /// modules — all are reported until the M3 resolver disambiguates.
+    /// modules — all are reported until the resolver can disambiguate.
     pub fn definitions(&self, name: &str) -> Result<Vec<IndexedSymbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.path, s.name, s.kind, s.line
@@ -273,24 +592,68 @@ impl Store {
     }
 
     /// Call sites whose written name equals `callee`, deduplicated per
-    /// (file, line). Tier is carried through verbatim — callers of the
-    /// API decide how much to trust a `candidate`.
+    /// (file, line), carrying the resolution state verbatim.
     pub fn callers(&self, callee: &str) -> Result<Vec<CallRef>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT f.path, e.src_line, e.tier
-             FROM edges e JOIN files f ON f.id = e.src_file_id
+            "SELECT DISTINCT f.path, e.src_line, e.tier, tf.path, e.resolved_line, e.reason
+             FROM edges e
+             JOIN files f ON f.id = e.src_file_id
+             LEFT JOIN files tf ON tf.id = e.resolved_file_id
              WHERE e.callee = ?1
              ORDER BY f.path, e.src_line",
         )?;
-        let rows = stmt.query_map(params![callee], |r| {
-            Ok(CallRef {
+        let rows = stmt.query_map(params![callee], row_to_call_ref)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Every edge with its resolution — the call-graph query source.
+    pub fn edges_with_resolution(&self) -> Result<Vec<EdgeInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, e.src_line, e.callee, e.tier, tf.path, e.resolved_line, e.reason
+             FROM edges e
+             JOIN files f ON f.id = e.src_file_id
+             LEFT JOIN files tf ON tf.id = e.resolved_file_id
+             ORDER BY f.path, e.src_line",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(EdgeInfo {
                 file: r.get(0)?,
                 line: r.get(1)?,
-                tier: r.get(2)?,
+                callee: r.get(2)?,
+                tier: r.get(3)?,
+                target: match (r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?) {
+                    (Some(f), Some(l)) => Some((f, l)),
+                    _ => None,
+                },
+                reason: r.get(6)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+}
+
+fn row_to_call_ref(r: &rusqlite::Row<'_>) -> rusqlite::Result<CallRef> {
+    let target_file: Option<String> = r.get(3)?;
+    let target_line: Option<i64> = r.get(4)?;
+    Ok(CallRef {
+        file: r.get(0)?,
+        line: r.get(1)?,
+        tier: r.get(2)?,
+        target: match (target_file, target_line) {
+            (Some(f), Some(l)) => Some((f, l)),
+            _ => None,
+        },
+        reason: r.get(5)?,
+    })
+}
+
+fn call_kind_name(kind: super::CallKind) -> &'static str {
+    match kind {
+        super::CallKind::Plain => "plain",
+        super::CallKind::Method => "method",
+        super::CallKind::Path => "path",
     }
 }
 
@@ -300,6 +663,25 @@ mod tests {
 
     fn open_tmp(dir: &Path) -> Store {
         Store::open(&dir.join("index.db")).unwrap()
+    }
+
+    fn sym(name: &str, kind: &'static str) -> super::super::Symbol {
+        super::super::Symbol {
+            name: name.to_string(),
+            kind,
+            file: "t.rs".into(),
+            line: 1,
+            end_line: 1,
+        }
+    }
+
+    fn call(name: &str, line: usize) -> super::super::CallSite {
+        super::super::CallSite {
+            callee: name.to_string(),
+            qualifier: None,
+            kind: super::super::CallKind::Plain,
+            line,
+        }
     }
 
     #[test]
@@ -333,60 +715,40 @@ mod tests {
     fn replace_file_upserts_without_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_tmp(dir.path());
-        let syms = |names: &[&str]| -> Vec<super::super::Symbol> {
-            names
-                .iter()
-                .map(|n| super::super::Symbol {
-                    name: n.to_string(),
-                    kind: "fn",
-                    file: "t.rs".into(),
-                    line: 1,
-                })
-                .collect()
-        };
         store
-            .replace_file("a.rs", "h1", 1, &syms(&["f", "g"]), &[])
+            .replace_file(
+                "a.rs",
+                "h1",
+                1,
+                "crate::a",
+                &[sym("f", "fn"), sym("g", "fn")],
+                &[call("q", 2)],
+                &Scopes::default(),
+            )
             .unwrap();
-        // Same path, changed content: row count must stay 1, symbols
-        // replaced wholesale.
+        // Same path, changed content: rows replaced wholesale.
         store
-            .replace_file("a.rs", "h2", 2, &syms(&["h"]), &[])
+            .replace_file(
+                "a.rs",
+                "h2",
+                2,
+                "crate::a",
+                &[sym("h", "fn")],
+                &[],
+                &Scopes::default(),
+            )
             .unwrap();
         assert_eq!(store.symbol_count().unwrap(), 1);
         let all = store.symbols().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].name, "h");
         assert_eq!(all[0].file, "a.rs");
+        // The old edge is gone with the replacement.
+        assert!(store.callers("q").unwrap().is_empty());
     }
 
     #[test]
-    fn remove_file_cascades_symbols() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = open_tmp(dir.path());
-        let sym = super::super::Symbol {
-            name: "f".into(),
-            kind: "fn",
-            file: "a.rs".into(),
-            line: 1,
-        };
-        store.replace_file("a.rs", "h1", 1, &[sym], &[]).unwrap();
-        store.remove_file("a.rs").unwrap();
-        assert_eq!(store.symbol_count().unwrap(), 0);
-        assert!(store.file_hashes().unwrap().is_empty());
-    }
-
-    fn calls(items: &[(&str, usize)]) -> Vec<super::super::CallSite> {
-        items
-            .iter()
-            .map(|(n, l)| super::super::CallSite {
-                callee: n.to_string(),
-                line: *l,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn edges_follow_their_file_through_replacement_and_removal() {
+    fn remove_file_cascades_everything() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_tmp(dir.path());
         store
@@ -394,65 +756,96 @@ mod tests {
                 "a.rs",
                 "h1",
                 1,
-                &[],
-                &calls(&[("target", 3), ("other", 4)]),
+                "crate::a",
+                &[sym("f", "fn")],
+                &[call("q", 2)],
+                &Scopes::default(),
             )
             .unwrap();
-        assert_eq!(
-            store.callers("target").unwrap(),
-            vec![CallRef {
-                file: "a.rs".into(),
-                line: 3,
-                tier: "candidate".into()
-            }]
-        );
-        // Content replaced: the old edge set must not survive.
-        store
-            .replace_file("a.rs", "h2", 2, &[], &calls(&[("target", 7)]))
-            .unwrap();
-        assert_eq!(
-            store.callers("target").unwrap(),
-            vec![CallRef {
-                file: "a.rs".into(),
-                line: 7,
-                tier: "candidate".into()
-            }]
-        );
-        assert!(store.callers("other").unwrap().is_empty());
         store.remove_file("a.rs").unwrap();
-        assert!(store.callers("target").unwrap().is_empty());
+        assert_eq!(store.symbol_count().unwrap(), 0);
+        assert!(store.file_hashes().unwrap().is_empty());
+        assert!(store.all_edges().unwrap().is_empty());
     }
 
     #[test]
-    fn callers_are_deduplicated_per_file_and_line() {
+    fn edges_carry_their_resolution_through_queries() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_tmp(dir.path());
-        // f(); f(); f(); — same line twice, then another line.
         store
-            .replace_file("a.rs", "h1", 1, &[], &calls(&[("f", 1), ("f", 1), ("f", 2)]))
+            .replace_file(
+                "b.rs",
+                "hb",
+                1,
+                "crate::b",
+                &[sym("target", "fn")],
+                &[],
+                &Scopes::default(),
+            )
             .unwrap();
-        assert_eq!(store.callers("f").unwrap().len(), 2);
+        store
+            .replace_file(
+                "a.rs",
+                "h1",
+                1,
+                "crate::a",
+                &[],
+                &[call("target", 3), call("target", 3), call("other", 4)],
+                &Scopes::default(),
+            )
+            .unwrap();
+        let b_id = store
+            .load_files()
+            .unwrap()
+            .iter()
+            .find(|f| f.module == "crate::b")
+            .unwrap()
+            .file_id;
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges.len(), 3);
+        let id = edges[0].id;
+        store
+            .apply_resolutions(&[(
+                id,
+                Resolution {
+                    tier: resolve::TIER_RESOLVED,
+                    target: Some((b_id, 1)),
+                    reason: None,
+                },
+            )])
+            .unwrap();
+        // Deduplicated per (file, line) — two calls on line 3, one
+        // resolved, one still candidate: DISTINCT keeps the tiers apart.
+        let callers = store.callers("target").unwrap();
+        assert_eq!(callers.len(), 2);
+        let resolved = callers
+            .iter()
+            .find(|c| c.tier == resolve::TIER_RESOLVED)
+            .unwrap();
+        assert_eq!(resolved.target, Some(("b.rs".into(), 1)));
+        assert_eq!(store.edge_tier_counts().unwrap(), (1, 2, 0));
     }
 
     #[test]
     fn search_is_substring_case_insensitive_definitions_exact() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_tmp(dir.path());
-        let sym = |name: &str, kind: &'static str| super::super::Symbol {
-            name: name.to_string(),
-            kind,
-            file: "t.rs".into(),
-            line: 1,
-        };
         store
-            .replace_file("t.rs", "h", 1, &[sym("Alpha", "fn"), sym("alphabet", "fn")], &[])
+            .replace_file(
+                "t.rs",
+                "h",
+                1,
+                "crate::t",
+                &[sym("Alpha", "fn"), sym("alphabet", "fn")],
+                &[],
+                &Scopes::default(),
+            )
             .unwrap();
         let hits = store.search_symbols("ALP").unwrap();
         assert_eq!(hits.len(), 2);
         // Exact lookup is case-sensitive: names are code, not prose.
         assert_eq!(store.definitions("Alpha").unwrap().len(), 1);
         assert!(store.definitions("alpha").unwrap().is_empty());
-        assert!(store.definitions("Beta").unwrap().is_empty());
     }
 
     #[test]

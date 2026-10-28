@@ -42,6 +42,27 @@ cargo run -- scan <путь>        # M0: инвентарь символов
 - Следующая веха: **M3** — свой резолвер имён (модульное дерево +
   use-пути + учёт impl/trait) → resolved-рёбра, `call_tree`,
   `blast_radius`.
+- **M3 готов** (2026-10-28): свой резолвер имён. `src/scopes.rs` —
+  inline-модули со спанами, impl/trait-спаны, use-деревья (группы,
+  алиасы, glob, self/super/crate, ведущий `::`). `src/resolve.rs` —
+  модульное дерево из раскладки файлов (корни: каталоги с lib.rs/
+  main.rs; один корень → ns `crate`), резолв: plain (items модуля →
+  use-биндинги), path (квалификатор: тип → impl-таблица, модуль,
+  `crate::`/`self::`/`super::`, алиас крейта из имени каталога),
+  `Self::` внутри impl. Честность: метод-вызовы — всегда
+  `candidate(method-call)` (нужен вывод типов, его нет), glob —
+  `candidate(glob-import)`, внешние крейты/неоднозначности —
+  unresolved/candidate с причиной. `src/query.rs` — `call_tree` /
+  `blast_radius`: подъём от места вызова к объемлющей fn (символы
+  получили `end_line`; попутно фикс: `impl<T> Pair<T>` больше не
+  называется `T`). Схема v2 (+module у files; modules/impls/traits/
+  imports; resolved_file_id/line/reason у edges), extractor v3,
+  резолюция пересчитывается целиком при каждом `index` (дешёво в
+  памяти). 42/42 теста, clippy чисто, мутации роняют тесты;
+  само-индекс: 178 символов / 1541 ребро (186 resolved, 1093
+  candidate, 262 unresolved), `call_tree lex` доходит до main.rs:82;
+  повторная индексация 0 parsed.
+- Следующая веха: **M4** — MCP-сервер stdio с 7 инструментами.
 
 ## Важно
 
