@@ -124,6 +124,16 @@ pub fn symbol_key(row: &SemanticRow) -> String {
     crate::sha256_hex(material.as_bytes())[..16].to_string()
 }
 
+/// A usable embedding: non-empty, finite and not the zero vector. Zero
+/// vectors are what a confused runner returns instead of an error.
+fn valid_vector(vector: &[f32]) -> bool {
+    if vector.is_empty() {
+        return false;
+    }
+    let norm_sq: f32 = vector.iter().map(|x| x * x).sum();
+    norm_sq.is_finite() && norm_sq > 1e-6
+}
+
 /// The instance refuses a key whose claim was stored with a different
 /// payload (HTTP 200 with `idempotency_conflict: true`, `stored: false`)
 /// and `forget` does not release the claim. Binding the key to a hash of
@@ -325,6 +335,38 @@ impl Client {
     /// instance runs `client_only`: vectors are ours, cached in SQLite,
     /// sent on write and read.
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Chunked: one call per 256 texts keeps a request small. A single
+        // 4k-text call was observed to leave the runner answering zero
+        // vectors for everything afterwards.
+        const CHUNK: usize = 256;
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(CHUNK) {
+            let mut vectors = self.embed_chunk(chunk)?;
+            if !vectors.iter().all(|v| valid_vector(v)) {
+                // A runner under load can answer with zero/NaN vectors
+                // instead of failing; writing or searching with those
+                // would corrupt results silently. Reload the model once.
+                eprintln!(
+                    "codeindex: embedder returned an invalid vector; reloading {} and retrying",
+                    self.cfg.embed_model
+                );
+                self.unload_embedder()?;
+                vectors = self.embed_chunk(chunk)?;
+                if !vectors.iter().all(|v| valid_vector(v)) {
+                    bail!(
+                        "embedding model {} still returns zero/invalid vectors after a reload; \
+                         restart the embedder (e.g. `ollama stop {}`)",
+                        self.cfg.embed_model,
+                        self.cfg.embed_model
+                    );
+                }
+            }
+            out.extend(vectors);
+        }
+        Ok(out)
+    }
+
+    fn embed_chunk(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let request = json!({ "model": self.cfg.embed_model, "input": texts });
         let url = format!("{}/api/embed", self.cfg.embed_url);
         let response = self
@@ -359,6 +401,14 @@ impl Client {
             );
         }
         Ok(out)
+    }
+
+    /// Ask the embedder to drop the model; the next call loads it fresh.
+    fn unload_embedder(&self) -> Result<()> {
+        let url = format!("{}/api/generate", self.cfg.embed_url);
+        let body = json!({ "model": self.cfg.embed_model, "keep_alive": 0 });
+        self.transport.request("POST", &url, "", Some(&body))?;
+        Ok(())
     }
 
     /// Idempotent by `key`: re-sending the same key + text is a no-op,
@@ -569,7 +619,7 @@ pub fn sync(store: &Store, client: &Client) -> Result<SyncStats> {
                 .embedding(key)
                 .ok()
                 .flatten()
-                .filter(|(model, _)| model == &client.cfg.embed_model)
+                .filter(|(model, vec)| model == &client.cfg.embed_model && valid_vector(vec))
                 .map(|(_, vec)| vec)
         })
         .collect();
@@ -629,6 +679,9 @@ mod tests {
         pushes: RefCell<Vec<Value>>,
         batch_calls: Cell<usize>,
         embed_calls: Cell<usize>,
+        unload_calls: Cell<usize>,
+        zero_embed_once: Cell<bool>,
+        zero_embed_always: Cell<bool>,
         forgets: RefCell<Vec<String>>,
         recall: RefCell<Vec<Value>>,
     }
@@ -658,6 +711,12 @@ mod tests {
             _token: &str,
             body: Option<&Value>,
         ) -> Result<Value> {
+            if url.ends_with("/api/generate") {
+                self.state
+                    .unload_calls
+                    .set(self.state.unload_calls.get() + 1);
+                return Ok(json!({ "done": true }));
+            }
             if url.ends_with("/api/embed") {
                 self.state.embed_calls.set(self.state.embed_calls.get() + 1);
                 let count = body
@@ -665,8 +724,16 @@ mod tests {
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or(0);
+                let zeros =
+                    self.state.zero_embed_always.get() || self.state.zero_embed_once.replace(false);
                 let vectors: Vec<Value> = (0..count)
-                    .map(|i| json!([0.1, 0.2, 0.3, 0.4 + i as f64 * 0.01]))
+                    .map(|i| {
+                        if zeros {
+                            json!([0.0, 0.0, 0.0, 0.0])
+                        } else {
+                            json!([0.1, 0.2, 0.3, 0.4 + i as f64 * 0.01])
+                        }
+                    })
                     .collect();
                 return Ok(json!({ "embeddings": vectors }));
             }
@@ -782,6 +849,36 @@ mod tests {
             "fn lex(src: &str) -> Vec<Token> {"
         );
         assert!(parse_marker("just a memory").is_none());
+    }
+
+    #[test]
+    fn zero_vectors_reload_the_embedder_and_retry() {
+        let (mock, state) = Mock::new();
+        state.zero_embed_once.set(true);
+        let client = Client::with_transport(cfg(), Box::new(mock));
+        let vectors = client.embed(&["text".to_string()]).unwrap();
+        assert!(valid_vector(&vectors[0]));
+        assert_eq!(state.unload_calls.get(), 1);
+        assert_eq!(state.embed_calls.get(), 2);
+    }
+
+    #[test]
+    fn persistent_zero_vectors_are_an_error() {
+        let (mock, state) = Mock::new();
+        state.zero_embed_always.set(true);
+        let client = Client::with_transport(cfg(), Box::new(mock));
+        let err = client.embed(&["text".to_string()]).unwrap_err().to_string();
+        assert!(err.contains("zero/invalid vectors"), "{err}");
+    }
+
+    #[test]
+    fn embeddings_are_requested_in_bounded_chunks() {
+        let (mock, state) = Mock::new();
+        let client = Client::with_transport(cfg(), Box::new(mock));
+        let texts: Vec<String> = (0..300).map(|i| format!("text {i}")).collect();
+        client.embed(&texts).unwrap();
+        // 300 texts / 256 per call → two requests.
+        assert_eq!(state.embed_calls.get(), 2);
     }
 
     #[test]
