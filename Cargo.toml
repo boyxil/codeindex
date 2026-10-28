@@ -9,6 +9,8 @@ repository = "https://github.com/boyxil/codeindex"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

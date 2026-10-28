@@ -1,6 +1,7 @@
 //! codeindex — local code index for AI agents.
 //! M0: walk a Rust tree, lex every file with the in-house lexer,
 //! report the symbol inventory.
+//! M1: incremental SQLite index at <path>/.codeindex/index.db.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -18,6 +19,12 @@ enum Command {
     /// Parse a Rust tree and report the symbol inventory.
     Scan {
         /// Repository root (walks *.rs under it, skips target/ and .git/).
+        path: PathBuf,
+    },
+    /// Build or incrementally update the SQLite index at
+    /// <path>/.codeindex/index.db.
+    Index {
+        /// Repository root.
         path: PathBuf,
     },
 }
@@ -51,6 +58,17 @@ fn main() -> Result<()> {
             if inv.symbols.len() > 20 {
                 println!("  … and {} more", inv.symbols.len() - 20);
             }
+        }
+        Command::Index { path } => {
+            let stats = codeindex::index(&path)?;
+            println!(
+                "{} files seen: {} parsed, {} unchanged, {} removed — {} symbols total",
+                stats.files_seen,
+                stats.parsed,
+                stats.unchanged,
+                stats.removed,
+                stats.symbols
+            );
         }
     }
     Ok(())

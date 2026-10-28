@@ -13,9 +13,12 @@
 //! M3 adds the in-house name resolver (use-tree + module tree).
 
 pub mod lexer;
+pub mod store;
 
 use anyhow::Context;
 use lexer::{lex, text, Tok};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// One extracted symbol.
@@ -97,6 +100,83 @@ pub fn scan(root: &Path) -> anyhow::Result<Inventory> {
         extract_items(&lex(&src), &src, &file, &mut inv.symbols);
     }
     Ok(inv)
+}
+
+/// Counters of one `index` run.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct IndexStats {
+    pub files_seen: usize,
+    /// New or changed since the last run — re-lexed and re-stored.
+    pub parsed: usize,
+    /// Content hash matched the stored one — parse skipped.
+    pub unchanged: usize,
+    /// Indexed before, gone from disk now.
+    pub removed: usize,
+    /// Total symbol rows in the store after the run.
+    pub symbols: usize,
+}
+
+/// Build or update the SQLite index at `<root>/.codeindex/index.db`.
+///
+/// Incrementality: a file is re-lexed only when its SHA-256 differs from
+/// the stored hash. mtime is recorded for humans but never trusted for
+/// decisions — a copy that preserves mtime while changing bytes must
+/// still be caught. Files present in the store but absent on disk are
+/// dropped. Paths are stored relative to the root so the index survives
+/// moving the checkout.
+pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
+    let db = root.join(".codeindex").join("index.db");
+    let store = store::Store::open(&db)?;
+    let files = rust_files(root);
+    let mut stats = IndexStats {
+        files_seen: files.len(),
+        ..Default::default()
+    };
+    let known = store.file_hashes()?;
+    let mut seen: HashSet<String> = HashSet::with_capacity(files.len());
+
+    for file in files {
+        let src = std::fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        let hash = sha256_hex(src.as_bytes());
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .to_string();
+        seen.insert(rel.clone());
+        if known.get(&rel).is_some_and(|h| h == &hash) {
+            stats.unchanged += 1;
+            continue;
+        }
+        let mtime = std::fs::metadata(&file)?
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut symbols = Vec::new();
+        extract_items(&lex(&src), &src, &file, &mut symbols);
+        store.replace_file(&rel, &hash, mtime, &symbols)?;
+        stats.parsed += 1;
+    }
+
+    for path in known.keys() {
+        if !seen.contains(path) {
+            store.remove_file(path)?;
+            stats.removed += 1;
+        }
+    }
+    stats.symbols = store.symbol_count()?;
+    Ok(stats)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Collect *.rs files without following skipped directories.
@@ -299,5 +379,65 @@ mod tests {
         let syms = symbols("fn outer() {\n    fn helper() {}\n    struct Inner;\n}\n");
         let names: Vec<&str> = syms.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["outer", "helper", "Inner"]);
+    }
+
+    fn write(path: &Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn index_reparses_only_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a.rs"), "fn one() {}\n");
+        write(&dir.path().join("b.rs"), "fn two() {}\n");
+
+        let s = index(dir.path()).unwrap();
+        assert_eq!(s, IndexStats { files_seen: 2, parsed: 2, unchanged: 0, removed: 0, symbols: 2 });
+
+        // Nothing changed: the second run must skip parsing entirely.
+        let s = index(dir.path()).unwrap();
+        assert_eq!(s, IndexStats { files_seen: 2, parsed: 0, unchanged: 2, removed: 0, symbols: 2 });
+
+        // One file edited: only it is re-parsed; its new symbol lands.
+        write(&dir.path().join("b.rs"), "fn two() {}\nfn three() {}\n");
+        let s = index(dir.path()).unwrap();
+        assert_eq!(s, IndexStats { files_seen: 2, parsed: 1, unchanged: 1, removed: 0, symbols: 3 });
+
+        let store = store::Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        let all = store.symbols().unwrap();
+        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn index_drops_files_deleted_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone.rs");
+        write(&gone, "fn vanished() {}\n");
+        write(&dir.path().join("kept.rs"), "fn kept() {}\n");
+        index(dir.path()).unwrap();
+
+        std::fs::remove_file(&gone).unwrap();
+        let s = index(dir.path()).unwrap();
+        assert_eq!(s, IndexStats { files_seen: 1, parsed: 0, unchanged: 1, removed: 1, symbols: 1 });
+
+        let store = store::Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        let all = store.symbols().unwrap();
+        let files: Vec<&str> = all.iter().map(|s| s.file.as_str()).collect();
+        assert_eq!(files, vec!["kept.rs"]);
+    }
+
+    #[test]
+    fn index_stores_root_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        write(&dir.path().join("src/lib.rs"), "fn inside() {}\n");
+        index(dir.path()).unwrap();
+
+        let store = store::Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        let all = store.symbols().unwrap();
+        let sym = &all[0];
+        assert_eq!(sym.file, "src/lib.rs");
+        assert_eq!(sym.line, 1);
     }
 }
