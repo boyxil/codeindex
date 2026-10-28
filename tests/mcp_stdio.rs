@@ -51,8 +51,8 @@ fn stdio_session_speaks_mcp() {
     let mut by_id: HashMap<u64, serde_json::Value> = HashMap::new();
     for line in BufReader::new(&out.stdout[..]).lines() {
         let line = line.unwrap();
-        let value: serde_json::Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("bad line {line:?}: {e}"));
+        let value: serde_json::Value =
+            serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad line {line:?}: {e}"));
         if let Some(id) = value.get("id").and_then(|i| i.as_u64()) {
             by_id.insert(id, value);
         }
@@ -64,7 +64,7 @@ fn stdio_session_speaks_mcp() {
     assert_eq!(init["result"]["serverInfo"]["name"], "codeindex");
 
     // tools/list: seven tools, no notification answer (no id 0).
-    assert_eq!(by_id[&2]["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(by_id[&2]["result"]["tools"].as_array().unwrap().len(), 8);
 
     // get_callers: the call site resolves to the definition.
     let text = by_id[&3]["result"]["content"][0]["text"].as_str().unwrap();

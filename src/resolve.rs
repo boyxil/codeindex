@@ -179,9 +179,7 @@ impl Resolver {
         for f in files {
             program.modules.insert(f.module.clone());
             for m in &f.module_spans {
-                program
-                    .modules
-                    .insert(format!("{}::{}", f.module, m.path));
+                program.modules.insert(format!("{}::{}", f.module, m.path));
             }
             let in_body = |line: i64| {
                 f.impl_spans
@@ -246,6 +244,13 @@ impl Resolver {
         let module = deepen(&ctx.module, &ctx.spans, edge.src_line);
         match edge.call_kind.as_str() {
             "method" => candidate(R_METHOD),
+            // `self.foo()` has a known receiver: the enclosing impl's
+            // type. Outside an impl the code does not compile, so the
+            // edge stays an honest candidate there.
+            "self_method" => match self.self_type(ctx, edge.src_line) {
+                Some(t) => self.resolve_in_impl(&t, &edge.callee),
+                None => candidate(R_METHOD),
+            },
             "path" => match &edge.qualifier {
                 Some(q) => {
                     let self_type = self.self_type(ctx, edge.src_line);
@@ -275,11 +280,7 @@ impl Resolver {
             .program
             .items
             .get(module)
-            .map(|v| {
-                v.iter()
-                    .filter(|i| i.name == name && !i.in_body)
-                    .collect()
-            })
+            .map(|v| v.iter().filter(|i| i.name == name && !i.in_body).collect())
             .unwrap_or_default();
         match local.len() {
             1 if local[0].kind == "fn" => return resolved((local[0].file_id, local[0].line)),
@@ -349,7 +350,14 @@ impl Resolver {
         match binding {
             None => unresolved(R_QUALIFIER),
             Some(Binding::Module(m)) => {
-                match self.program.items.get(&m).into_iter().flatten().find(|i| i.name == name) {
+                match self
+                    .program
+                    .items
+                    .get(&m)
+                    .into_iter()
+                    .flatten()
+                    .find(|i| i.name == name)
+                {
                     Some(it) if it.kind == "fn" => resolved((it.file_id, it.line)),
                     Some(_) => unresolved(R_NOT_FN),
                     None => unresolved(R_NOT_IN_MODULE),
@@ -506,7 +514,11 @@ mod tests {
         (dir, store.edges_with_resolution().unwrap())
     }
 
-    fn at<'a>(edges: &'a [crate::store::EdgeInfo], file: &str, line: i64) -> &'a crate::store::EdgeInfo {
+    fn at<'a>(
+        edges: &'a [crate::store::EdgeInfo],
+        file: &str,
+        line: i64,
+    ) -> &'a crate::store::EdgeInfo {
         edges
             .iter()
             .find(|e| e.file == file && e.line == line)
@@ -515,7 +527,10 @@ mod tests {
 
     #[test]
     fn plain_calls_resolve_within_the_module() {
-        let (_d, e) = run(&[("lib.rs", "fn helper() {}\nfn caller() {\n    helper();\n}\n")]);
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "fn helper() {}\nfn caller() {\n    helper();\n}\n",
+        )]);
         let edge = at(&e, "lib.rs", 3);
         assert_eq!(edge.tier, TIER_RESOLVED);
         assert_eq!(edge.target, Some(("lib.rs".into(), 1)));
@@ -537,10 +552,7 @@ mod tests {
     fn super_paths_and_inline_module_paths_resolve() {
         let (_d, e) = run(&[
             ("lib.rs", "mod a {\n    pub fn target() {}\n}\n"),
-            (
-                "b.rs",
-                "use super::a;\nfn go() {\n    a::target();\n}\n",
-            ),
+            ("b.rs", "use super::a;\nfn go() {\n    a::target();\n}\n"),
         ]);
         // `a::target()` from crate::b — qualifier `a` found as a module.
         let edge = at(&e, "b.rs", 3);
@@ -568,10 +580,24 @@ mod tests {
     }
 
     #[test]
+    fn self_method_calls_resolve_inside_the_impl() {
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "struct S;\nimpl S {\n    fn helper(&self) {}\n    fn go(&self) {\n        self.helper();\n    }\n}\n",
+        )]);
+        let edge = at(&e, "lib.rs", 5);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("lib.rs".into(), 3)));
+    }
+
+    #[test]
     fn method_calls_stay_candidates_and_say_why() {
         let (_d, e) = run(&[("lib.rs", "fn f(x: &Vec<u8>) {\n    x.push(1);\n}\n")]);
         let edge = at(&e, "lib.rs", 2);
-        assert_eq!(edge.tier, TIER_CANDIDATE, "type inference is not implemented");
+        assert_eq!(
+            edge.tier, TIER_CANDIDATE,
+            "type inference is not implemented"
+        );
         assert_eq!(edge.reason.as_deref(), Some(R_METHOD));
         assert_eq!(edge.target, None);
     }

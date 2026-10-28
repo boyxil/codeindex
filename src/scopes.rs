@@ -230,7 +230,13 @@ fn trait_header(tokens: &[Token], src: &str, at: usize) -> Option<(String, usize
 
 /// Parse a `use` declaration whose `use` token sits at `at`; appends the
 /// bindings it introduces and returns the index after the `;`.
-fn parse_use(tokens: &[Token], src: &str, at: usize, end: usize, out: &mut Scopes) -> Option<usize> {
+fn parse_use(
+    tokens: &[Token],
+    src: &str,
+    at: usize,
+    end: usize,
+    out: &mut Scopes,
+) -> Option<usize> {
     let mut items: Vec<(String, bool)> = Vec::new();
     let mut depth = 0i32;
     let mut j = at + 1;
@@ -286,11 +292,7 @@ impl UseParser<'_> {
         let alias = match alias {
             Some(a) => a.to_string(),
             None if glob => String::new(),
-            None => path
-                .rsplit("::")
-                .next()
-                .unwrap_or_default()
-                .to_string(),
+            None => path.rsplit("::").next().unwrap_or_default().to_string(),
         };
         if !path.is_empty() && !alias.is_empty() || glob && !path.is_empty() {
             self.out.uses.push(UseDecl {
@@ -390,7 +392,10 @@ mod tests {
         assert_eq!(impls, vec![("Foo", 1, 1), ("Pair", 5, 7)]);
         assert_eq!(scopes.traits.len(), 1);
         assert_eq!(scopes.traits[0].name, "Bar");
-        assert_eq!((scopes.traits[0].start_line, scopes.traits[0].end_line), (2, 4));
+        assert_eq!(
+            (scopes.traits[0].start_line, scopes.traits[0].end_line),
+            (2, 4)
+        );
     }
 
     #[test]

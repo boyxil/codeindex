@@ -7,8 +7,8 @@
 //! is a guess, and that is the point.
 
 use crate::query::{self, CallNode};
-use crate::yantrik;
 use crate::store::{self, Store};
+use crate::yantrik;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -24,6 +24,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "get_references",
     "call_tree",
     "blast_radius",
+    "get_symbol",
     "stats",
 ];
 
@@ -134,11 +135,7 @@ impl McpServer {
             }
         }
         let store = self.store()?;
-        let sarg = |key: &str| {
-            args.get(key)
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        };
+        let sarg = |key: &str| args.get(key).and_then(|v| v.as_str()).map(str::to_string);
         let narg = |key: &str, default: usize| {
             args.get(key)
                 .and_then(|v| v.as_u64())
@@ -160,21 +157,33 @@ impl McpServer {
                              and CODEINDEX_YANTRIK_URL set"
                         );
                     };
-                    let hits = client.recall(&query, limit)?;
+                    let hits = yantrik::hybrid_search(&store, client, &query, limit)?;
                     let mut out = format!(
                         "{} semantic hit(s) for \"{query}\" (namespace {}):\n",
                         hits.len(),
                         client.config().namespace
                     );
                     for h in &hits {
+                        let score = if h.source == "lexical" {
+                            "lex  ".to_string()
+                        } else {
+                            format!("{:.2} ", h.score)
+                        };
+                        let signature = if h.signature.is_empty() {
+                            "(name match)".to_string()
+                        } else {
+                            h.signature.clone()
+                        };
                         out.push_str(&format!(
-                            "  {:.2}  {:>7} {} {}:{}  {}\n",
-                            h.score, h.kind, h.name, h.file, h.line, h.signature
+                            "  {} {:>7} {} {}:{}  {}\n",
+                            score, h.kind, h.name, h.file, h.line, signature
                         ));
                     }
                     return Ok(out);
                 }
-                let hits = store.search_symbols(&query)?;
+                let kind = sarg("kind");
+                let path = sarg("path");
+                let hits = store.search_symbols(&query, kind.as_deref(), path.as_deref())?;
                 let shown = hits.len().min(limit);
                 let mut out = format!("{} match(es) for \"{query}\":\n", hits.len());
                 for s in hits.iter().take(limit) {
@@ -237,10 +246,7 @@ impl McpServer {
                             "  {}:{}  {} → {}:{}\n",
                             r.file, r.line, r.kind, f, l
                         )),
-                        None => out.push_str(&format!(
-                            "  {}:{}  {}\n",
-                            r.file, r.line, r.kind
-                        )),
+                        None => out.push_str(&format!("  {}:{}  {}\n", r.file, r.line, r.kind)),
                     }
                 }
                 out
@@ -268,6 +274,18 @@ impl McpServer {
                     out.push_str(&format!("  d{} {}:{}\n", a.depth, a.file, a.line));
                 }
                 out
+            }
+            "get_symbol" => {
+                let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
+                let file = sarg("file");
+                let max_lines = narg("max_lines", 120);
+                match query::symbol_source(&store, &self.root, &name, file.as_deref(), max_lines)? {
+                    Some(src) => format!(
+                        "{} {} at {}:{}-{}:\n{}",
+                        src.kind, src.name, src.file, src.start, src.end, src.text
+                    ),
+                    None => format!("no symbol named \"{name}\"\n"),
+                }
             }
             "stats" => {
                 let (resolved, candidate, unresolved) = store.edge_tier_counts()?;
@@ -347,7 +365,9 @@ fn tools() -> Value {
             json!({
                 "query": { "type": "string", "description": "Substring of a symbol name, or a natural-language description in semantic mode" },
                 "limit": { "type": "integer", "minimum": 1, "description": "Max results (default 50)" },
-                "mode": { "type": "string", "enum": ["lexical", "semantic"], "description": "lexical = name substring (default); semantic = recall from the dedicated YantrikDB code instance (needs --semantic)" }
+                "mode": { "type": "string", "enum": ["lexical", "semantic"], "description": "lexical = name substring (default); semantic = recall from the dedicated YantrikDB code instance (needs --semantic)" },
+                "kind": { "type": "string", "description": "Exact kind filter: fn, struct, enum, trait, impl, mod, union" },
+                "path": { "type": "string", "description": "Only symbols whose file path contains this substring" }
             }),
             json!(["query"])
         ),
@@ -385,6 +405,16 @@ fn tools() -> Value {
             "blast_radius",
             "Everything that transitively calls this symbol through resolved edges — what a change here can reach.",
             json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
+            json!(["name"])
+        ),
+        tool(
+            "get_symbol",
+            "Source of a symbol: declaration through its closing brace (fns) or the declaration line, read from the file.",
+            json!({
+                "name": { "type": "string", "description": "Exact symbol name" },
+                "file": { "type": "string", "description": "Restrict to this file (exact or suffix)" },
+                "max_lines": { "type": "integer", "minimum": 1, "description": "Line cap (default 120)" }
+            }),
             json!(["name"])
         ),
         tool(
@@ -498,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_exactly_the_seven_tools() {
+    fn tools_list_exposes_exactly_the_eight_tools() {
         let (_d, server) = fixture();
         let resp = call(&server, 2, "tools/list", json!({}));
         let tools = resp["result"]["tools"].as_array().unwrap();
@@ -528,6 +558,14 @@ mod tests {
         assert!(text.contains("lib.rs:1  definition"), "{text}");
         assert!(text.contains("lib.rs:3  call → lib.rs:1"), "{text}");
         assert!(text.contains("lib.rs:4  mention"), "{text}");
+    }
+
+    #[test]
+    fn get_symbol_returns_the_body() {
+        let (_d, server) = fixture();
+        let text = tool_text(&server, "get_symbol", json!({ "name": "caller" }));
+        assert!(text.contains("fn caller()"), "{text}");
+        assert!(text.contains("helper();"), "{text}");
     }
 
     #[test]

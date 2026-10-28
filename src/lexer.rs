@@ -88,7 +88,12 @@ pub fn lex(src: &str) -> Vec<Token> {
                 if i < b.len() {
                     i += 1;
                 }
-                out.push(Token { kind: Tok::Literal, start, end: i, line: start_line });
+                out.push(Token {
+                    kind: Tok::Literal,
+                    start,
+                    end: i,
+                    line: start_line,
+                });
             }
 
             b'\'' => {
@@ -105,7 +110,12 @@ pub fn lex(src: &str) -> Vec<Token> {
                     if i < b.len() {
                         i += 1;
                     }
-                    out.push(Token { kind: Tok::Literal, start, end: i, line });
+                    out.push(Token {
+                        kind: Tok::Literal,
+                        start,
+                        end: i,
+                        line,
+                    });
                 } else if i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
                     // 'ident then either closing ' (char literal 'a') or
                     // nothing (lifetime 'a) — the lookahead decides.
@@ -115,14 +125,29 @@ pub fn lex(src: &str) -> Vec<Token> {
                     }
                     if j < b.len() && b[j] == b'\'' {
                         i = j + 1;
-                        out.push(Token { kind: Tok::Literal, start, end: i, line });
+                        out.push(Token {
+                            kind: Tok::Literal,
+                            start,
+                            end: i,
+                            line,
+                        });
                     } else {
                         i = j;
-                        out.push(Token { kind: Tok::Lifetime, start, end: i, line });
+                        out.push(Token {
+                            kind: Tok::Lifetime,
+                            start,
+                            end: i,
+                            line,
+                        });
                     }
                 } else {
                     i += 1;
-                    out.push(Token { kind: Tok::Punct, start, end: i, line });
+                    out.push(Token {
+                        kind: Tok::Punct,
+                        start,
+                        end: i,
+                        line,
+                    });
                 }
             }
 
@@ -134,7 +159,9 @@ pub fn lex(src: &str) -> Vec<Token> {
                 }
                 // Float dot: only when followed by a digit or `_` — keeps
                 // `0..range` and `1.method()` intact.
-                if i < b.len() && b[i] == b'.' && i + 1 < b.len()
+                if i < b.len()
+                    && b[i] == b'.'
+                    && i + 1 < b.len()
                     && (b[i + 1].is_ascii_digit() || b[i + 1] == b'_')
                 {
                     i += 1;
@@ -142,7 +169,12 @@ pub fn lex(src: &str) -> Vec<Token> {
                         i += 1;
                     }
                 }
-                out.push(Token { kind: Tok::Num, start, end: i, line });
+                out.push(Token {
+                    kind: Tok::Num,
+                    start,
+                    end: i,
+                    line,
+                });
             }
 
             c if c == b'_' || c.is_ascii_alphabetic() => {
@@ -163,8 +195,7 @@ pub fn lex(src: &str) -> Vec<Token> {
                     }
                 }
                 let is_raw_str = c == b'r' && j < b.len() && b[j] == b'"';
-                let is_raw_byte = c == b'b' && j + 1 < b.len()
-                    && b[j] == b'r' && b[j + 1] == b'"';
+                let is_raw_byte = c == b'b' && j + 1 < b.len() && b[j] == b'r' && b[j + 1] == b'"';
                 let is_byte_str = c == b'b' && j < b.len() && (b[j] == b'"');
                 let is_byte_char = c == b'b' && j < b.len() && (b[j] == b'\'');
 
@@ -189,7 +220,12 @@ pub fn lex(src: &str) -> Vec<Token> {
                         }
                         i += 1;
                     }
-                    out.push(Token { kind: Tok::Literal, start, end: i, line: start_line });
+                    out.push(Token {
+                        kind: Tok::Literal,
+                        start,
+                        end: i,
+                        line: start_line,
+                    });
                 } else if is_byte_str || is_byte_char {
                     let term = if is_byte_char { b'\'' } else { b'"' };
                     i = j + 1;
@@ -202,18 +238,38 @@ pub fn lex(src: &str) -> Vec<Token> {
                     if i < b.len() {
                         i += 1;
                     }
-                    out.push(Token { kind: Tok::Literal, start, end: i, line: start_line });
+                    out.push(Token {
+                        kind: Tok::Literal,
+                        start,
+                        end: i,
+                        line: start_line,
+                    });
                 } else {
                     while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                         i += 1;
                     }
-                    out.push(Token { kind: Tok::Ident, start, end: i, line: start_line });
+                    out.push(Token {
+                        kind: Tok::Ident,
+                        start,
+                        end: i,
+                        line: start_line,
+                    });
                 }
             }
 
             _ => {
-                i += 1;
-                out.push(Token { kind: Tok::Punct, start: i - 1, end: i, line });
+                // Consume the WHOLE UTF-8 scalar: byte-at-a-time Punct
+                // tokens would land token bounds inside a multibyte
+                // character (e.g. `…` in code), and any later text()
+                // slice on such a token panics on the char boundary.
+                let ch_len = src[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                i += ch_len;
+                out.push(Token {
+                    kind: Tok::Punct,
+                    start: i - ch_len,
+                    end: i,
+                    line,
+                });
             }
         }
     }
@@ -248,7 +304,9 @@ mod tests {
         assert!(toks.iter().any(|(k, t)| *k == Tok::Literal && t == "'x'"));
         assert!(toks.iter().any(|(k, t)| *k == Tok::Lifetime && t == "'a"));
         // The escaped quote must not end the string early.
-        assert!(toks.iter().any(|(k, t)| *k == Tok::Literal && t.contains('b')));
+        assert!(toks
+            .iter()
+            .any(|(k, t)| *k == Tok::Literal && t.contains('b')));
     }
 
     #[test]
@@ -257,7 +315,8 @@ mod tests {
             "const A: &str = r#\"line1 \"quoted\" line2\"#;\n/* outer /* inner */ still */\nconst B = 1;\n",
         );
         assert!(
-            toks.iter().any(|(k, t)| *k == Tok::Literal && t.contains("quoted")),
+            toks.iter()
+                .any(|(k, t)| *k == Tok::Literal && t.contains("quoted")),
             "raw string kept whole: {toks:?}"
         );
         assert!(!toks.iter().any(|(_, t)| t == "still"));
@@ -287,9 +346,15 @@ mod tests {
     #[test]
     fn byte_and_prefixed_literals_stay_whole() {
         let toks = kinds("let a = b\"x\\\"y\"; let r2 = r\"raw\"; let c = b'q';\n");
-        assert!(toks.iter().any(|(k, t)| *k == Tok::Literal && t.starts_with("b\"")));
-        assert!(toks.iter().any(|(k, t)| *k == Tok::Literal && t.starts_with("r\"")));
-        assert!(toks.iter().any(|(k, t)| *k == Tok::Literal && t.starts_with("b'")));
+        assert!(toks
+            .iter()
+            .any(|(k, t)| *k == Tok::Literal && t.starts_with("b\"")));
+        assert!(toks
+            .iter()
+            .any(|(k, t)| *k == Tok::Literal && t.starts_with("r\"")));
+        assert!(toks
+            .iter()
+            .any(|(k, t)| *k == Tok::Literal && t.starts_with("b'")));
         assert!(!toks.iter().any(|(_, t)| t == "y"));
     }
 }

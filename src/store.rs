@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: &str = "3";
 /// scopes since M3). Unlike schema_version this describes the *derived*
 /// data: bumping it makes stored hashes stale as parse decisions, so the
 /// next index run re-parses everything once.
-pub const EXTRACTOR_VERSION: &str = "5";
+pub const EXTRACTOR_VERSION: &str = "6";
 
 /// One indexed symbol joined with its file — the read API M2 queries
 /// grow from.
@@ -86,16 +86,16 @@ impl Store {
     /// refusing is the honest move, silently migrating is not.
     pub fn open(db_path: &Path) -> Result<Store> {
         if let Some(dir) = db_path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("opening {}", db_path.display()))?;
+        let conn =
+            Connection::open(db_path).with_context(|| format!("opening {}", db_path.display()))?;
         // WAL survives a crashed run; foreign keys make symbol cleanup
         // ride on file deletion.
-        let _mode: String =
-            conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        // Two writers exist by design: the MCP server and manual CLI
+        // runs. Wait instead of failing with "database is locked".
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (
@@ -227,7 +227,11 @@ impl Store {
                 r.get(0)
             })?;
         for table in ["symbols", "edges", "modules", "impls", "traits", "imports"] {
-            let column = if table == "edges" { "src_file_id" } else { "file_id" };
+            let column = if table == "edges" {
+                "src_file_id"
+            } else {
+                "file_id"
+            };
             tx.execute(
                 &format!("DELETE FROM {table} WHERE {column} = ?1"),
                 params![file_id],
@@ -272,7 +276,12 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
             for m in &scopes.modules {
-                stmt.execute(params![file_id, m.path, m.start_line as i64, m.end_line as i64])?;
+                stmt.execute(params![
+                    file_id,
+                    m.path,
+                    m.start_line as i64,
+                    m.end_line as i64
+                ])?;
             }
         }
         {
@@ -281,7 +290,12 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
             for i in &scopes.impls {
-                stmt.execute(params![file_id, i.type_name, i.start_line as i64, i.end_line as i64])?;
+                stmt.execute(params![
+                    file_id,
+                    i.type_name,
+                    i.start_line as i64,
+                    i.end_line as i64
+                ])?;
             }
         }
         {
@@ -290,7 +304,12 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
             for t in &scopes.traits {
-                stmt.execute(params![file_id, t.name, t.start_line as i64, t.end_line as i64])?;
+                stmt.execute(params![
+                    file_id,
+                    t.name,
+                    t.start_line as i64,
+                    t.end_line as i64
+                ])?;
             }
         }
         {
@@ -344,7 +363,9 @@ impl Store {
         let mut files: Vec<FileData> = Vec::new();
         let mut index_of: HashMap<i64, usize> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare("SELECT id, module FROM files ORDER BY path")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, module FROM files ORDER BY path")?;
             let rows = stmt.query_map([], |r| {
                 Ok(FileData {
                     file_id: r.get(0)?,
@@ -460,9 +481,9 @@ impl Store {
 
     /// Every call edge, without resolution fields.
     pub fn all_edges(&self) -> Result<Vec<EdgeRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, src_file_id, src_line, callee, qualifier, call_kind FROM edges",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, src_file_id, src_line, callee, qualifier, call_kind FROM edges")?;
         let rows = stmt.query_map([], |r| {
             Ok(EdgeRow {
                 id: r.get(0)?,
@@ -504,9 +525,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT tier, COUNT(*) FROM edges GROUP BY tier")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         let (mut resolved, mut candidate, mut unresolved) = (0usize, 0usize, 0usize);
         for row in rows {
             let (tier, n) = row?;
@@ -632,16 +651,24 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Substring, case-insensitive match on the symbol name. Filtering
-    /// happens in Rust rather than SQL: a `%needle%` LIKE cannot use the
-    /// name index anyway, and Rust lowercasing is Unicode-correct where
+    /// Substring, case-insensitive match on the symbol name, optionally
+    /// narrowed by exact kind and by a path substring. Filtering happens
+    /// in Rust rather than SQL: a `%needle%` LIKE cannot use the name
+    /// index anyway, and Rust lowercasing is Unicode-correct where
     /// SQLite's is ASCII-only.
-    pub fn search_symbols(&self, query: &str) -> Result<Vec<IndexedSymbol>> {
+    pub fn search_symbols(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<Vec<IndexedSymbol>> {
         let needle = query.to_lowercase();
         Ok(self
             .symbols()?
             .into_iter()
             .filter(|s| s.name.to_lowercase().contains(&needle))
+            .filter(|s| kind.is_none_or(|k| s.kind == k))
+            .filter(|s| path.is_none_or(|p| s.file.contains(p)))
             .collect())
     }
 
@@ -728,6 +755,7 @@ fn call_kind_name(kind: super::CallKind) -> &'static str {
     match kind {
         super::CallKind::Plain => "plain",
         super::CallKind::Method => "method",
+        super::CallKind::MethodSelf => "self_method",
         super::CallKind::Path => "path",
     }
 }
@@ -917,8 +945,34 @@ mod tests {
                 &Scopes::default(),
             )
             .unwrap();
-        let hits = store.search_symbols("ALP").unwrap();
+        let hits = store.search_symbols("ALP", None, None).unwrap();
         assert_eq!(hits.len(), 2);
+        // Kind and path filters narrow without touching the match.
+        assert_eq!(
+            store.search_symbols("alp", Some("fn"), None).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store
+                .search_symbols("alp", Some("struct"), None)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .search_symbols("alp", None, Some("t.rs"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .search_symbols("alp", None, Some("nope"))
+                .unwrap()
+                .len(),
+            0
+        );
         // Exact lookup is case-sensitive: names are code, not prose.
         assert_eq!(store.definitions("Alpha").unwrap().len(), 1);
         assert!(store.definitions("alpha").unwrap().is_empty());

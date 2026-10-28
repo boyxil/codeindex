@@ -66,9 +66,12 @@ pub struct Remote {
     pub key: Option<String>,
 }
 
-/// One semantic hit, hydrated from its marker.
+/// One search hit: semantic (score = recall score) or lexical (score 0,
+/// `source == "lexical"`), hydrated from the marker or the index.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
+    /// `semantic` | `lexical`
+    pub source: &'static str,
     pub score: f64,
     pub file: String,
     pub kind: String,
@@ -143,25 +146,13 @@ fn text_signature(text: &str, marker: &Marker) -> String {
 
 /// Transport seam: real TCP in production, a canned responder in tests.
 pub trait Transport {
-    fn request(
-        &self,
-        method: &str,
-        url: &str,
-        token: &str,
-        body: Option<&Value>,
-    ) -> Result<Value>;
+    fn request(&self, method: &str, url: &str, token: &str, body: Option<&Value>) -> Result<Value>;
 }
 
 pub struct HttpTransport;
 
 impl Transport for HttpTransport {
-    fn request(
-        &self,
-        method: &str,
-        url: &str,
-        token: &str,
-        body: Option<&Value>,
-    ) -> Result<Value> {
+    fn request(&self, method: &str, url: &str, token: &str, body: Option<&Value>) -> Result<Value> {
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let (host, port, path) = parse_http_url(url)?;
         let mut stream = TcpStream::connect_timeout(
@@ -182,7 +173,10 @@ impl Transport for HttpTransport {
         if body.is_some() {
             req.push_str("Content-Type: application/json\r\n");
         }
-        req.push_str(&format!("Content-Length: {}\r\n\r\n{payload}", payload.len()));
+        req.push_str(&format!(
+            "Content-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ));
         stream.write_all(req.as_bytes())?;
         stream.flush()?;
         let mut raw = Vec::new();
@@ -196,9 +190,7 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String)> {
         .split_once("://")
         .with_context(|| format!("URL without scheme: {url}"))?;
     if scheme != "http" {
-        bail!(
-            "only http:// is supported (got {scheme}://); the code instance is local"
-        );
+        bail!("only http:// is supported (got {scheme}://); the code instance is local");
     }
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].trim_end_matches('/').to_string()),
@@ -252,11 +244,8 @@ fn decode_chunked_if_needed(head: &str, body: &[u8]) -> Result<Vec<u8>> {
             .position(|w| w == b"\r\n")
             .context("chunked body: missing size line")?;
         let size_line = std::str::from_utf8(&body[pos..pos + line_end])?;
-        let size = usize::from_str_radix(
-            size_line.split(';').next().unwrap_or("").trim(),
-            16,
-        )
-        .context("chunked body: bad chunk size")?;
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+            .context("chunked body: bad chunk size")?;
         pos += line_end + 2;
         if size == 0 {
             break;
@@ -290,13 +279,21 @@ impl Client {
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        self.transport
-            .request("POST", &format!("{}{path}", self.cfg.url), &self.cfg.token, Some(body))
+        self.transport.request(
+            "POST",
+            &format!("{}{path}", self.cfg.url),
+            &self.cfg.token,
+            Some(body),
+        )
     }
 
     fn get(&self, path: &str) -> Result<Value> {
-        self.transport
-            .request("GET", &format!("{}{path}", self.cfg.url), &self.cfg.token, None)
+        self.transport.request(
+            "GET",
+            &format!("{}{path}", self.cfg.url),
+            &self.cfg.token,
+            None,
+        )
     }
 
     /// Idempotent by `key`: re-sending the same key + text is a no-op,
@@ -305,28 +302,42 @@ impl Client {
         self.remember_many(&[(key.to_string(), text.to_string())])
     }
 
-    /// Batch form of [`Client::remember`]. The instance's quota allows
-    /// 10k items per call; chunks of 500 keep requests bounded and are
-    /// still 100× fewer round-trips than one-call-per-symbol.
+    /// Batch form of [`Client::remember`]. The instance rejects request
+    /// bodies over 64 KiB (HTTP 413), and its quota allows 10k items per
+    /// call — so batches are bounded by *payload size*, not count.
     pub fn remember_many(&self, items: &[(String, String)]) -> Result<()> {
-        for chunk in items.chunks(500) {
-            let memories: Vec<Value> = chunk
-                .iter()
-                .map(|(key, text)| {
-                    json!({
-                        "text": text,
-                        "memory_type": "semantic",
-                        "importance": 0.5,
-                        "namespace": self.cfg.namespace,
-                        "domain": self.cfg.domain,
-                        "idempotency_key": key,
-                    })
-                })
-                .collect();
-            let response = self.post("/v1/remember/batch", &json!({ "memories": memories }))?;
-            if let Some(err) = response.get("error") {
-                bail!("remember batch refused: {err}");
+        const BUDGET: usize = 48 * 1024;
+        let mut batch: Vec<Value> = Vec::new();
+        let mut size = 0usize;
+        for (key, text) in items {
+            let item = json!({
+                "text": text,
+                "memory_type": "semantic",
+                "importance": 0.5,
+                "namespace": self.cfg.namespace,
+                "domain": self.cfg.domain,
+                "idempotency_key": key,
+            });
+            // Serialized item length + a little JSON framing.
+            let item_len = key.len() + text.len() + 96;
+            if !batch.is_empty() && size + item_len > BUDGET {
+                self.remember_batch(&batch)?;
+                batch.clear();
+                size = 0;
             }
+            size += item_len;
+            batch.push(item);
+        }
+        if !batch.is_empty() {
+            self.remember_batch(&batch)?;
+        }
+        Ok(())
+    }
+
+    fn remember_batch(&self, memories: &[Value]) -> Result<()> {
+        let response = self.post("/v1/remember/batch", &json!({ "memories": memories }))?;
+        if let Some(err) = response.get("error") {
+            bail!("remember batch refused: {err}");
         }
         Ok(())
     }
@@ -357,7 +368,8 @@ impl Client {
             }
             let count = items.len();
             for item in items {
-                if item.get("namespace").and_then(|v| v.as_str()) != Some(self.cfg.namespace.as_str())
+                if item.get("namespace").and_then(|v| v.as_str())
+                    != Some(self.cfg.namespace.as_str())
                 {
                     continue;
                 }
@@ -400,6 +412,7 @@ impl Client {
                 continue; // not ours — never present foreign records as symbols
             };
             hits.push(Hit {
+                source: "semantic",
                 score: item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 file: marker.file.clone(),
                 kind: marker.kind.clone(),
@@ -410,6 +423,42 @@ impl Client {
         }
         Ok(hits)
     }
+}
+
+/// Semantic recall merged with exact lexical matches on the query text.
+///
+/// The embedder is weak on identifiers and on cross-lingual short
+/// queries; a symbol literally named like the query should never be
+/// missing from the answer. Semantic order is preserved, lexical-only
+/// hits are appended and labelled.
+pub fn hybrid_search(
+    store: &Store,
+    client: &Client,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Hit>> {
+    let mut hits = client.recall(query, limit)?;
+    for symbol in store.search_symbols(query, None, None)? {
+        if hits.len() >= limit {
+            break;
+        }
+        if hits
+            .iter()
+            .any(|h| h.file == symbol.file && h.line == symbol.line)
+        {
+            continue;
+        }
+        hits.push(Hit {
+            source: "lexical",
+            score: 0.0,
+            file: symbol.file,
+            kind: symbol.kind,
+            name: symbol.name,
+            line: symbol.line,
+            signature: String::new(),
+        });
+    }
+    Ok(hits)
 }
 
 /// Delta sync of the whole index into the code instance: push what is
@@ -443,7 +492,8 @@ pub fn sync(store: &Store, client: &Client) -> Result<SyncStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     fn row(file: &str, name: &str, line: i64, signature: &str) -> SemanticRow {
         SemanticRow {
@@ -455,22 +505,30 @@ mod tests {
         }
     }
 
-    /// Canned responder that keeps the instance's state in memory.
-    struct Mock {
+    /// Instance state shared between the transport and the assertions.
+    #[derive(Default)]
+    struct MockState {
         records: RefCell<Vec<(String, String, String)>>, // rid, text, namespace
         pushes: RefCell<Vec<Value>>,
+        batch_calls: Cell<usize>,
         forgets: RefCell<Vec<String>>,
         recall: RefCell<Vec<Value>>,
     }
 
+    /// Canned responder that keeps the instance's state in memory.
+    struct Mock {
+        state: Rc<MockState>,
+    }
+
     impl Mock {
-        fn new() -> Mock {
-            Mock {
-                records: RefCell::new(Vec::new()),
-                pushes: RefCell::new(Vec::new()),
-                forgets: RefCell::new(Vec::new()),
-                recall: RefCell::new(Vec::new()),
-            }
+        fn new() -> (Mock, Rc<MockState>) {
+            let state = Rc::new(MockState::default());
+            (
+                Mock {
+                    state: state.clone(),
+                },
+                state,
+            )
         }
     }
 
@@ -486,14 +544,15 @@ mod tests {
             match (method, path) {
                 ("POST", "remember") => {
                     let body = body.cloned().unwrap_or_default();
-                    self.pushes.borrow_mut().push(body.clone());
+                    self.state.pushes.borrow_mut().push(body.clone());
                     let key = body["idempotency_key"].as_str().unwrap_or("").to_string();
                     let text = body["text"].as_str().unwrap_or("").to_string();
-                    let mut records = self.records.borrow_mut();
+                    let mut records = self.state.records.borrow_mut();
                     // idempotency: same key + text keeps the existing rid
-                    if let Some((rid, ..)) = records.iter().find(|(_, t, _)| {
-                        t.contains(&format!("key={key} ")) && t == &text
-                    }) {
+                    if let Some((rid, ..)) = records
+                        .iter()
+                        .find(|(_, t, _)| t.contains(&format!("key={key} ")) && t == &text)
+                    {
                         return Ok(json!({ "rid": rid }));
                     }
                     let rid = format!("rid-{}", records.len() + 1);
@@ -505,15 +564,16 @@ mod tests {
                     Ok(json!({ "rid": rid }))
                 }
                 ("POST", "remember/batch") => {
+                    self.state.batch_calls.set(self.state.batch_calls.get() + 1);
                     let items = body
                         .and_then(|b| b.get("memories"))
                         .and_then(|v| v.as_array())
                         .cloned()
                         .unwrap_or_default();
                     let mut rids = Vec::new();
-                    let mut records = self.records.borrow_mut();
+                    let mut records = self.state.records.borrow_mut();
                     for item in items {
-                        self.pushes.borrow_mut().push(item.clone());
+                        self.state.pushes.borrow_mut().push(item.clone());
                         let rid = format!("rid-{}", records.len() + 1);
                         records.push((
                             rid.clone(),
@@ -526,22 +586,24 @@ mod tests {
                 }
                 ("GET", p) if p.starts_with("memories") => {
                     let items: Vec<Value> = self
+                        .state
                         .records
                         .borrow()
                         .iter()
-                        .map(|(rid, text, ns)| {
-                            json!({ "rid": rid, "text": text, "namespace": ns })
-                        })
+                        .map(|(rid, text, ns)| json!({ "rid": rid, "text": text, "namespace": ns }))
                         .collect();
                     Ok(json!({ "items": items, "total": items.len() }))
                 }
                 ("POST", "forget") => {
-                    let rid = body.and_then(|b| b["rid"].as_str()).unwrap_or("").to_string();
-                    self.forgets.borrow_mut().push(rid.clone());
-                    self.records.borrow_mut().retain(|(r, ..)| r != &rid);
+                    let rid = body
+                        .and_then(|b| b["rid"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.state.forgets.borrow_mut().push(rid.clone());
+                    self.state.records.borrow_mut().retain(|(r, ..)| r != &rid);
                     Ok(json!({ "found": true }))
                 }
-                ("POST", "recall") => Ok(json!({ "results": self.recall.borrow().clone() })),
+                ("POST", "recall") => Ok(json!({ "results": self.state.recall.borrow().clone() })),
                 _ => bail!("unexpected {method} {url}"),
             }
         }
@@ -556,9 +618,25 @@ mod tests {
         }
     }
 
+    fn symbol(name: &str, file: &str, line: usize, signature: &str) -> crate::Symbol {
+        crate::Symbol {
+            name: name.into(),
+            kind: "fn",
+            file: file.into(),
+            line,
+            end_line: line,
+            signature: signature.into(),
+        }
+    }
+
     #[test]
     fn marker_roundtrips_and_rejects_foreign_text() {
-        let r = row("src/lexer.rs", "lex", 33, "fn lex(src: &str) -> Vec<Token> {");
+        let r = row(
+            "src/lexer.rs",
+            "lex",
+            33,
+            "fn lex(src: &str) -> Vec<Token> {",
+        );
         let key = symbol_key(&r);
         let text = memory_text(&key, &r);
         let marker = parse_marker(&text).unwrap();
@@ -578,7 +656,10 @@ mod tests {
     fn keys_are_content_addressed() {
         let a = row("src/a.rs", "f", 1, "fn f() {}");
         let b = row("src/a.rs", "f", 1, "fn f(x: u8) {}");
-        assert_eq!(symbol_key(&a), symbol_key(&row("src/a.rs", "f", 1, "fn f() {}")));
+        assert_eq!(
+            symbol_key(&a),
+            symbol_key(&row("src/a.rs", "f", 1, "fn f() {}"))
+        );
         assert_ne!(symbol_key(&a), symbol_key(&b));
     }
 
@@ -586,27 +667,19 @@ mod tests {
     fn sync_pushes_missing_and_forgets_stale() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("index.db")).unwrap();
-        let mock = Mock::new();
+        let (mock, _state) = Mock::new();
         let client = Client::with_transport(cfg(), Box::new(mock));
 
-        let a = row("a.rs", "alpha", 1, "fn alpha() {}");
-        let b = row("b.rs", "beta", 2, "fn beta() {}");
+        let scopes = crate::scopes::Scopes::default();
         store
             .replace_file(
                 "a.rs",
                 "h",
                 1,
                 "crate::a",
-                &[crate::Symbol {
-                    name: "alpha".into(),
-                    kind: "fn",
-                    file: "a.rs".into(),
-                    line: 1,
-                    end_line: 1,
-                    signature: "fn alpha() {}".into(),
-                }],
+                &[symbol("alpha", "a.rs", 1, "fn alpha() {}")],
                 &[],
-                &crate::scopes::Scopes::default(),
+                &scopes,
             )
             .unwrap();
         store
@@ -615,39 +688,71 @@ mod tests {
                 "h",
                 1,
                 "crate::b",
-                &[crate::Symbol {
-                    name: "beta".into(),
-                    kind: "fn",
-                    file: "b.rs".into(),
-                    line: 2,
-                    end_line: 2,
-                    signature: "fn beta() {}".into(),
-                }],
+                &[symbol("beta", "b.rs", 2, "fn beta() {}")],
                 &[],
-                &crate::scopes::Scopes::default(),
+                &scopes,
             )
             .unwrap();
         let first = sync(&store, &client).unwrap();
-        assert_eq!(first, SyncStats { pushed: 2, existing: 0, forgotten: 0 });
+        assert_eq!(
+            first,
+            SyncStats {
+                pushed: 2,
+                existing: 0,
+                forgotten: 0
+            }
+        );
 
         // Nothing changed: nothing is pushed.
         let second = sync(&store, &client).unwrap();
-        assert_eq!(second, SyncStats { pushed: 0, existing: 2, forgotten: 0 });
+        assert_eq!(
+            second,
+            SyncStats {
+                pushed: 0,
+                existing: 2,
+                forgotten: 0
+            }
+        );
 
         // beta disappears: its record is forgotten, alpha stays.
         store.remove_file("b.rs").unwrap();
         let third = sync(&store, &client).unwrap();
-        assert_eq!(third, SyncStats { pushed: 0, existing: 1, forgotten: 1 });
-        let _ = (a, b);
+        assert_eq!(
+            third,
+            SyncStats {
+                pushed: 0,
+                existing: 1,
+                forgotten: 1
+            }
+        );
+    }
+
+    #[test]
+    fn batches_are_bounded_by_payload_size() {
+        let (mock, state) = Mock::new();
+        let client = Client::with_transport(cfg(), Box::new(mock));
+        let pad = "x".repeat(500);
+        let items: Vec<(String, String)> =
+            (0..200).map(|i| (format!("key{i}"), pad.clone())).collect();
+        client.remember_many(&items).unwrap();
+        // 200 × ~600 B > 48 KiB budget → several requests, every item
+        // still sent exactly once.
+        assert!(state.batch_calls.get() >= 2, "{}", state.batch_calls.get());
+        assert_eq!(state.pushes.borrow().len(), 200);
     }
 
     #[test]
     fn recall_hydrates_only_marked_records() {
-        let mock = Mock::new();
-        let r = row("src/lib.rs", "scan", 254, "pub fn scan(root: &Path) -> Result<Inventory> {");
+        let (mock, state) = Mock::new();
+        let r = row(
+            "src/lib.rs",
+            "scan",
+            254,
+            "pub fn scan(root: &Path) -> Result<Inventory> {",
+        );
         let key = symbol_key(&r);
         {
-            let mut hits = mock.recall.borrow_mut();
+            let mut hits = state.recall.borrow_mut();
             hits.push(json!({
                 "score": 0.77,
                 "text": memory_text(&key, &r)
@@ -657,10 +762,49 @@ mod tests {
         let client = Client::with_transport(cfg(), Box::new(mock));
         let hits = client.recall("entry point for scanning a tree", 5).unwrap();
         assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, "semantic");
         assert_eq!(hits[0].name, "scan");
         assert_eq!(hits[0].line, 254);
         assert_eq!(hits[0].score, 0.77);
         assert!(hits[0].signature.starts_with("pub fn scan"));
+    }
+
+    #[test]
+    fn hybrid_search_appends_lexical_matches_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.db")).unwrap();
+        let alpha = row("a.rs", "alpha", 1, "fn alpha() {}");
+        store
+            .replace_file(
+                "a.rs",
+                "h",
+                1,
+                "crate::a",
+                &[symbol("alpha", "a.rs", 1, "fn alpha() {}")],
+                &[],
+                &crate::scopes::Scopes::default(),
+            )
+            .unwrap();
+        let (mock, state) = Mock::new();
+        {
+            let mut hits = state.recall.borrow_mut();
+            // The model picked a different symbol for "alpha".
+            let other = row("b.rs", "beta", 3, "fn beta() {}");
+            hits.push(json!({
+                "score": 0.9,
+                "text": memory_text(&symbol_key(&other), &other)
+            }));
+            // The same symbol the lexical pass will find: no duplicate.
+            hits.push(json!({
+                "score": 0.4,
+                "text": memory_text(&symbol_key(&alpha), &alpha)
+            }));
+        }
+        let client = Client::with_transport(cfg(), Box::new(mock));
+        let hits = hybrid_search(&store, &client, "alpha", 10).unwrap();
+        let names: Vec<(&str, &str)> = hits.iter().map(|h| (h.name.as_str(), h.source)).collect();
+        assert_eq!(names, vec![("beta", "semantic"), ("alpha", "semantic")]);
+        assert_eq!(hits.iter().filter(|h| h.name == "alpha").count(), 1);
     }
 
     #[test]

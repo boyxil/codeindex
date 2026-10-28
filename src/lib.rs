@@ -20,7 +20,6 @@ pub mod scopes;
 pub mod store;
 pub mod yantrik;
 
-use anyhow::Context;
 use lexer::{lex, text, Tok};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -55,6 +54,9 @@ pub enum CallKind {
     /// `x.foo()` — receiver type inference is out of scope, stays
     /// `candidate` with reason `method-call`.
     Method,
+    /// `self.foo()` — the receiver is the enclosing impl's type, so this
+    /// one *is* resolvable without inference.
+    MethodSelf,
     /// `Foo::bar(x)` — resolves through the qualifier.
     Path,
 }
@@ -74,6 +76,9 @@ pub struct CallSite {
 #[derive(Debug, Default)]
 pub struct Inventory {
     pub files: usize,
+    /// Files skipped because they could not be read as UTF-8. One bad
+    /// file must not abort the whole scan.
+    pub skipped: usize,
     pub symbols: Vec<Symbol>,
 }
 
@@ -135,11 +140,10 @@ const CALL_BLOCKERS: &[&str] = &["fn", "struct", "enum", "union"];
 /// code it only appears in type position (`Box<dyn Fn(u8)>`) yet lexes
 /// exactly like a call.
 const KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn",
-    "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
-    "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
-    "self", "Self", "static", "struct", "super", "trait", "true", "type",
-    "union", "unsafe", "use", "where", "while", "Fn", "FnMut", "FnOnce",
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "union",
+    "unsafe", "use", "where", "while", "Fn", "FnMut", "FnOnce",
 ];
 
 fn is_punct(src: &str, t: &lexer::Token, p: &str) -> bool {
@@ -197,7 +201,13 @@ pub fn extract_calls(tokens: &[lexer::Token], src: &str) -> Vec<CallSite> {
         }
         // Classify by what precedes the name: `.` = method call,
         // `::` = qualified path call, anything else = plain call.
-        let (kind, qualifier) = if i > 0 && is_punct(src, &tokens[i - 1], ".") {
+        let (kind, qualifier) = if i > 1
+            && is_punct(src, &tokens[i - 1], ".")
+            && tokens[i - 2].kind == Tok::Ident
+            && text(src, &tokens[i - 2]) == "self"
+        {
+            (CallKind::MethodSelf, None)
+        } else if i > 0 && is_punct(src, &tokens[i - 1], ".") {
             (CallKind::Method, None)
         } else if i >= 3
             && tokens[i - 3].kind == Tok::Ident
@@ -261,8 +271,14 @@ pub fn extract_calls(tokens: &[lexer::Token], src: &str) -> Vec<CallSite> {
 pub fn scan(root: &Path) -> anyhow::Result<Inventory> {
     let mut inv = Inventory::default();
     for file in rust_files(root) {
-        let src = std::fs::read_to_string(&file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let src = match std::fs::read_to_string(&file) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("codeindex: skipping {} — {e}", file.display());
+                inv.skipped += 1;
+                continue;
+            }
+        };
         inv.files += 1;
         extract_items(&lex(&src), &src, &file, &mut inv.symbols);
     }
@@ -279,6 +295,9 @@ pub struct IndexStats {
     pub unchanged: usize,
     /// Indexed before, gone from disk now.
     pub removed: usize,
+    /// Present on disk but unreadable (non-UTF-8, permissions) — left
+    /// with whatever rows they had.
+    pub skipped: usize,
     /// Total symbol rows in the store after the run.
     pub symbols: usize,
     /// Call edges and their resolution tiers after the run.
@@ -338,8 +357,18 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
     let mut seen: HashSet<String> = HashSet::with_capacity(files.len());
 
     for (file, rel) in files.iter().zip(&rels) {
-        let src = std::fs::read_to_string(file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        // One unreadable / non-UTF-8 file must not abort the run. The
+        // path stays "seen" so a transient read error does not wipe the
+        // rows already indexed for it.
+        let src = match std::fs::read_to_string(file) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("codeindex: skipping {} — {e}", file.display());
+                seen.insert(rel.clone());
+                stats.skipped += 1;
+                continue;
+            }
+        };
         let hash = sha256_hex(src.as_bytes());
         seen.insert(rel.clone());
         if known.get(rel).is_some_and(|h| h == &hash) {
@@ -542,7 +571,10 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if path.is_dir() {
+            // `DirEntry::file_type` does not follow links: a symlinked
+            // directory can cycle or escape the tree, so it is skipped.
+            // Symlinked *files* are indexed as written.
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 if name != "target" && name != ".git" && name != ".codeindex" {
                     walk(&path, out);
                 }
@@ -610,9 +642,7 @@ fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<
         // Method-call position guard: `.fn()` cannot occur (reserved),
         // but a path segment `Foo::fn` cannot either — the real hazard is
         // a field access like `x.union`, so skip after `.`.
-        if i > 0 && tokens[i - 1].kind == Tok::Punct
-            && text(src, &tokens[i - 1]) == "."
-        {
+        if i > 0 && tokens[i - 1].kind == Tok::Punct && text(src, &tokens[i - 1]) == "." {
             i += 1;
             continue;
         }
@@ -789,6 +819,19 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_punctuation_does_not_crash_the_scan() {
+        // Regression: `…` (3 bytes) in code position once produced
+        // byte-split Punct tokens and text() sliced inside the char.
+        let syms = symbols(
+            "fn f() {} … fn g() {}
+const S: &str = \"заявка…完成\";
+",
+        );
+        let names: Vec<&str> = syms.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["f", "g"]);
+    }
+
+    #[test]
     fn items_inside_fn_bodies_are_indexed_too() {
         let syms = symbols("fn outer() {\n    fn helper() {}\n    struct Inner;\n}\n");
         let names: Vec<&str> = syms.iter().map(|(n, _)| n.as_str()).collect();
@@ -893,17 +936,17 @@ mod tests {
     fn calls_are_extracted_with_guards() {
         let src = concat!(
             "\n",
-            "fn target() {}\n",              // 2: definition, not a call
-            "struct Point(i32, i32);\n",     // 3: definition, not a call
-            "let a = compute(1);\n",         // 4
-            "v.push(item());\n",             // 5: method + plain call
-            "let d = std::mem::drop(x);\n",  // 6: path — last segment wins
-            "let z = zero::<i32>(2);\n",     // 7: turbofish
-            "if ready() { return; }\n",      // 8: call after a keyword
+            "fn target() {}\n",                   // 2: definition, not a call
+            "struct Point(i32, i32);\n",          // 3: definition, not a call
+            "let a = compute(1);\n",              // 4
+            "v.push(item());\n",                  // 5: method + plain call
+            "let d = std::mem::drop(x);\n",       // 6: path — last segment wins
+            "let z = zero::<i32>(2);\n",          // 7: turbofish
+            "if ready() { return; }\n",           // 8: call after a keyword
             "let f: Box<fn(u8) -> u8> = None;\n", // 9: fn-pointer type
-            "let q = Point(3, 4);\n",        // 10: tuple-struct construction
-            "obj.method(arg);\n",            // 11
-            "let s = S { field: 1 };\n",     // 12: struct literal, no call
+            "let q = Point(3, 4);\n",             // 10: tuple-struct construction
+            "obj.method(arg);\n",                 // 11
+            "let s = S { field: 1 };\n",          // 12: struct literal, no call
         );
         let found = extract_calls(&lex(src), src);
         let calls: Vec<(&str, usize, CallKind, Option<&str>)> = found
@@ -923,6 +966,47 @@ mod tests {
                 ("method", 11, CallKind::Method, None),
             ]
         );
+    }
+
+    #[test]
+    fn self_receiver_is_classified_as_resolvable() {
+        let src =
+            "impl S {\n    fn a(&self) {\n        self.b();\n        self.field.c();\n    }\n}\n";
+        let calls = extract_calls(&lex(src), src);
+        assert_eq!(calls[0].callee, "b");
+        assert_eq!(calls[0].kind, CallKind::MethodSelf);
+        // `self.field.c()` — the receiver is a field, not self.
+        assert_eq!(calls[1].callee, "c");
+        assert_eq!(calls[1].kind, CallKind::Method);
+    }
+
+    #[test]
+    fn index_skips_non_utf8_files_without_aborting() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("good.rs"), "fn kept() {}\n");
+        std::fs::write(dir.path().join("bad.rs"), b"fn broken() {}\n\xff\xfe").unwrap();
+        let s = index(dir.path()).unwrap();
+        assert_eq!(s.files_seen, 2);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(s.symbols, 1);
+        // The unreadable file stays unknown, not half-indexed.
+        let store = store::Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        assert_eq!(store.file_paths().unwrap(), vec!["good.rs"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlinks_are_not_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a.rs"), "fn a() {}\n");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        write(&dir.path().join("sub/b.rs"), "fn b() {}\n");
+        // A cycle back to the root: following it would never terminate.
+        symlink(dir.path(), dir.path().join("loop_dir")).unwrap();
+        let inv = scan(dir.path()).unwrap();
+        assert_eq!(inv.files, 2);
+        assert_eq!(inv.total(), 2);
     }
 
     #[test]
