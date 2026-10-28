@@ -1,0 +1,18 @@
+# YantrikDB для codeindex (M5): отдельный инстанс, НЕ память.
+# Собственный data_dir, namespace "codeindex", domain "code".
+# Обслуживание/консолидация/затухание отключены: индекс кода обязан быть
+# детерминированным, memory-lifecycle его портит.
+[server]
+data_dir = "/var/lib/yantrikdb"
+
+[embedding]
+strategy = "builtin"
+dim = 384
+model_dir = "/models/models--Qdrant--paraphrase-multilingual-MiniLM-L12-v2-onnx-Q/snapshots/faf4aa4225822f3bc6376869cb1164e8e3feedd0"
+
+[maintenance]
+enabled = false
+
+[background]
+consolidation_interval_minutes = 5256000
+decay_sweep_interval_minutes = 5256000

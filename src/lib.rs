@@ -18,6 +18,7 @@ pub mod query;
 pub mod resolve;
 pub mod scopes;
 pub mod store;
+pub mod yantrik;
 
 use anyhow::Context;
 use lexer::{lex, text, Tok};
@@ -38,6 +39,11 @@ pub struct Symbol {
     /// items without a tracked body (only `fn` spans are computed —
     /// they are what the call-graph queries climb).
     pub end_line: usize,
+    /// The text the semantic layer embeds: the item's doc-comment block
+    /// followed by its declaration line (trimmed, truncated). It is the
+    /// item's own source, so it never claims anything the code does not
+    /// say.
+    pub signature: String,
 }
 
 /// How a call site was written. The resolver uses this: only plain and
@@ -487,7 +493,7 @@ fn package_name(root: &str, hint: Option<&str>) -> Option<String> {
     Some(last.to_string())
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     let mut out = String::with_capacity(digest.len() * 2);
     for b in digest {
@@ -549,10 +555,46 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Contiguous `///` / `//!` lines directly above `line` (1-based),
+/// regardless of `#[…]` attributes in between; a blank line or any other
+/// text stops the block. Docs are the strongest semantic signal a
+/// declaration carries, so the semantic layer embeds them.
+fn docs_above(lines: &[&str], line: usize) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut i = line.saturating_sub(1);
+    while i >= 1 {
+        let raw = lines.get(i - 1).map(|l| l.trim()).unwrap_or("");
+        if let Some(rest) = raw.strip_prefix("///").or_else(|| raw.strip_prefix("//!")) {
+            parts.push(rest.trim());
+        } else if raw.starts_with("#[") || raw.starts_with("#![") {
+            // Attributes between the docs and the item are fine.
+        } else {
+            break;
+        }
+        i -= 1;
+    }
+    parts.reverse();
+    parts.join(" ")
+}
+
 /// Token-level item extraction. A keyword opens an item when it is not
 /// in method-call position (preceded by `.`); a `fn` inside a type like
 /// `Box<fn(u8) -> u8>` is skipped because no Ident follows the keyword.
 fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<Symbol>) {
+    let lines: Vec<&str> = src.lines().collect();
+    let signature = |line: usize| -> String {
+        let decl = lines
+            .get(line.saturating_sub(1))
+            .map(|l| l.trim())
+            .unwrap_or("");
+        let docs = docs_above(&lines, line);
+        let text = if docs.is_empty() {
+            decl.to_string()
+        } else {
+            format!("{docs} {decl}")
+        };
+        text.chars().take(400).collect()
+    };
     let mut i = 0usize;
     while i < tokens.len() {
         let tok = &tokens[i];
@@ -600,6 +642,7 @@ fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<
                     file: file.to_path_buf(),
                     line: tok.line,
                     end_line,
+                    signature: signature(tok.line),
                 });
             }
             ItemKind::Impl => {
@@ -613,6 +656,7 @@ fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<
                         file: file.to_path_buf(),
                         line: tok.line,
                         end_line: tok.line,
+                        signature: signature(tok.line),
                     });
                     i = brace; // resume inside the impl body
                     continue;
@@ -699,6 +743,22 @@ mod tests {
         // impl body scan must survive the `::` path segments.
         assert!(syms.contains(&("Wrapper".into(), "impl")));
         assert!(syms.contains(&("Config".into(), "impl")));
+    }
+
+    #[test]
+    fn signatures_carry_doc_comments() {
+        let src = "/// Tokenize source into tokens.\n/// Handles strings.\n#[inline]\nfn lex() {}\n\nfn plain() {}\n";
+        let toks = lex(src);
+        let mut out = Vec::new();
+        extract_items(&toks, src, Path::new("t.rs"), &mut out);
+        assert!(
+            out[0].signature.contains("Tokenize source into tokens"),
+            "{}",
+            out[0].signature
+        );
+        assert!(out[0].signature.contains("Handles strings"));
+        assert!(out[0].signature.contains("fn lex()"));
+        assert_eq!(out[1].signature, "fn plain() {}");
     }
 
     #[test]

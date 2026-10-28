@@ -30,6 +30,10 @@ enum Command {
     Index {
         /// Repository root.
         path: PathBuf,
+        /// Also sync symbols into the dedicated YantrikDB code instance
+        /// (CODEINDEX_YANTRIK_URL) for semantic search.
+        #[arg(long)]
+        semantic: bool,
     },
     /// Find symbols whose name contains the query (case-insensitive).
     Search {
@@ -37,6 +41,10 @@ enum Command {
         path: PathBuf,
         /// Substring of a symbol name.
         query: String,
+        /// Use semantic recall from the YantrikDB code instance
+        /// (CODEINDEX_YANTRIK_URL) instead of substring matching.
+        #[arg(long)]
+        semantic: bool,
     },
     /// Show where a symbol with this exact name is defined.
     Definition {
@@ -88,6 +96,10 @@ enum Command {
         /// Skip the incremental re-index before each tool call.
         #[arg(long)]
         no_refresh: bool,
+        /// Keep the YantrikDB code instance in sync and allow semantic
+        /// search (CODEINDEX_YANTRIK_URL).
+        #[arg(long)]
+        semantic: bool,
     },
 }
 
@@ -125,7 +137,7 @@ fn main() -> Result<()> {
                 println!("  … and {} more", inv.symbols.len() - 20);
             }
         }
-        Command::Index { path } => {
+        Command::Index { path, semantic } => {
             let stats = codeindex::index(&path)?;
             println!(
                 "{} files seen: {} parsed, {} unchanged, {} removed — {} symbols, {} edges ({} resolved, {} candidate, {} unresolved)",
@@ -139,8 +151,27 @@ fn main() -> Result<()> {
                 stats.candidate,
                 stats.unresolved
             );
+            if semantic {
+                sync_semantic(&path)?;
+            }
         }
-        Command::Search { path, query } => {
+        Command::Search {
+            path,
+            query,
+            semantic,
+        } => {
+            if semantic {
+                let client = yantrik_client()?;
+                let hits = client.recall(&query, 20)?;
+                println!("{} semantic hit(s) for \"{}\":", hits.len(), query);
+                for h in &hits {
+                    println!(
+                        "  {:.2}  {:>7} {} {}:{}  {}",
+                        h.score, h.kind, h.name, h.file, h.line, h.signature
+                    );
+                }
+                return Ok(());
+            }
             let store = open(&path)?;
             let hits = store.search_symbols(&query)?;
             println!("{} matches for \"{}\":", hits.len(), query);
@@ -216,10 +247,37 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Serve { path, no_refresh } => {
-            codeindex::mcp::run_stdio(path, !no_refresh)?;
+        Command::Serve {
+            path,
+            no_refresh,
+            semantic,
+        } => {
+            codeindex::mcp::run_stdio(path, !no_refresh, semantic)?;
         }
     }
+    Ok(())
+}
+
+fn yantrik_client() -> Result<codeindex::yantrik::Client> {
+    let cfg = codeindex::yantrik::Config::from_env().ok_or_else(|| {
+        anyhow::anyhow!(
+            "semantic layer not configured: set CODEINDEX_YANTRIK_URL (and CODEINDEX_YANTRIK_TOKEN)"
+        )
+    })?;
+    Ok(codeindex::yantrik::Client::new(cfg))
+}
+
+fn sync_semantic(path: &Path) -> Result<()> {
+    let store = open(path)?;
+    let client = yantrik_client()?;
+    let stats = codeindex::yantrik::sync(&store, &client)?;
+    println!(
+        "semantic sync: {} pushed, {} already present, {} forgotten (namespace {})",
+        stats.pushed,
+        stats.existing,
+        stats.forgotten,
+        client.config().namespace
+    );
     Ok(())
 }
 

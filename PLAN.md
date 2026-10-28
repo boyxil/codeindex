@@ -80,8 +80,14 @@ health/историю/семантику, но не отвечает на стр
   по индексированным файлам (definition/call/mention; не-вызовы не
   выдаются за резолв). Живая stdio-сессия — integration test
   tests/mcp_stdio.rs. Подключение к zcode/opencode — AGENTS.md.
-- **M5 (опционально):** бэкенд YantrikDB + эмбеддинги сигнатур для
-  семантического поиска символов.
+- **M5 (готово):** семантика на ОТДЕЛЬНОМ инстансе YantrikDB (не
+  память): свой data_dir/порт, namespace `codeindex`, обслуживание
+  off. SQLite — истина; delta-синк строк объявлений (док-блок +
+  объявление) через batch-remember с idempotency_key; маркеры в тексте
+  делают hits самодостаточными; `recall` по namespace/domain. CLI
+  `index --semantic` / `search --semantic`; MCP `serve --semantic` и
+  `search_symbols {mode:"semantic"}`. Деплой — `deploy/` (compose +
+  toml). 58 тестов; живой прогон 266 записей, дельта 54 мс.
 
 ## Верификация (для каждой вехи)
 

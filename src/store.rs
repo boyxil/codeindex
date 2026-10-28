@@ -18,13 +18,13 @@ use std::path::Path;
 use crate::resolve::{self, EdgeRow, FileData, Resolution, SymRow};
 use crate::scopes::Scopes;
 
-pub const SCHEMA_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "3";
 
 /// What the extractor writes per file (symbols+edges since M2, call
 /// scopes since M3). Unlike schema_version this describes the *derived*
 /// data: bumping it makes stored hashes stale as parse decisions, so the
 /// next index run re-parses everything once.
-pub const EXTRACTOR_VERSION: &str = "3";
+pub const EXTRACTOR_VERSION: &str = "5";
 
 /// One indexed symbol joined with its file — the read API M2 queries
 /// grow from.
@@ -56,6 +56,17 @@ pub struct EdgeInfo {
     pub tier: String,
     pub target: Option<(String, i64)>,
     pub reason: Option<String>,
+}
+
+/// One symbol as the semantic layer sees it: the declaration line is the
+/// text embedded, so a hit can be hydrated without trusting the server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticRow {
+    pub file: String,
+    pub kind: String,
+    pub name: String,
+    pub line: i64,
+    pub signature: String,
 }
 
 pub struct Store {
@@ -104,7 +115,8 @@ impl Store {
                  name TEXT NOT NULL,
                  kind TEXT NOT NULL,
                  line INTEGER NOT NULL,
-                 end_line INTEGER NOT NULL
+                 end_line INTEGER NOT NULL,
+                 signature TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
              CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
@@ -223,8 +235,8 @@ impl Store {
         }
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO symbols(file_id, name, kind, line, end_line)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO symbols(file_id, name, kind, line, end_line, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for s in symbols {
                 stmt.execute(params![
@@ -232,7 +244,8 @@ impl Store {
                     s.name,
                     s.kind,
                     s.line as i64,
-                    s.end_line as i64
+                    s.end_line as i64,
+                    s.signature
                 ])?;
             }
         }
@@ -578,6 +591,27 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Every symbol with its declaration text — input for the semantic
+    /// sync (M5).
+    pub fn semantic_rows(&self) -> Result<Vec<SemanticRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, s.kind, s.name, s.line, s.signature
+             FROM symbols s JOIN files f ON f.id = s.file_id
+             ORDER BY f.path, s.line, s.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SemanticRow {
+                file: r.get(0)?,
+                kind: r.get(1)?,
+                name: r.get(2)?,
+                line: r.get(3)?,
+                signature: r.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Every indexed symbol joined with its file path, ordered for
     /// stable output.
     pub fn symbols(&self) -> Result<Vec<IndexedSymbol>> {
@@ -713,6 +747,7 @@ mod tests {
             file: "t.rs".into(),
             line: 1,
             end_line: 1,
+            signature: "fn t()".into(),
         }
     }
 

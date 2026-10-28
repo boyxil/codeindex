@@ -7,6 +7,7 @@
 //! is a guess, and that is the point.
 
 use crate::query::{self, CallNode};
+use crate::yantrik;
 use crate::store::{self, Store};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -33,15 +34,24 @@ pub struct McpServer {
     /// the checkout, and hashing a small tree is cheap. `--no-refresh`
     /// turns it off for huge repos or read-only settings.
     refresh: bool,
+    /// Semantic layer (`--semantic` + CODEINDEX_YANTRIK_URL): a
+    /// dedicated YantrikDB instance, never the agent memory one.
+    semantic: Option<yantrik::Client>,
 }
 
 impl McpServer {
-    pub fn new(root: PathBuf, refresh: bool) -> McpServer {
+    pub fn new(root: PathBuf, refresh: bool, semantic: bool) -> McpServer {
         let db_path = root.join(".codeindex").join("index.db");
+        let semantic = if semantic {
+            yantrik::Config::from_env().map(yantrik::Client::new)
+        } else {
+            None
+        };
         McpServer {
             root,
             db_path,
             refresh,
+            semantic,
         }
     }
 
@@ -113,6 +123,14 @@ impl McpServer {
                     "codeindex: refreshed {} file(s), {} symbols, {} edges",
                     stats.parsed, stats.symbols, stats.edges
                 );
+                if let Some(client) = &self.semantic {
+                    let store = self.store()?;
+                    let synced = yantrik::sync(&store, client)?;
+                    eprintln!(
+                        "codeindex: semantic sync — {} pushed, {} present, {} forgotten",
+                        synced.pushed, synced.existing, synced.forgotten
+                    );
+                }
             }
         }
         let store = self.store()?;
@@ -131,6 +149,31 @@ impl McpServer {
             "search_symbols" => {
                 let query = sarg("query").ok_or_else(|| anyhow::anyhow!("missing `query`"))?;
                 let limit = narg("limit", 50);
+                let mode = args
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("lexical");
+                if mode == "semantic" {
+                    let Some(client) = &self.semantic else {
+                        anyhow::bail!(
+                            "semantic mode needs the server started with --semantic \
+                             and CODEINDEX_YANTRIK_URL set"
+                        );
+                    };
+                    let hits = client.recall(&query, limit)?;
+                    let mut out = format!(
+                        "{} semantic hit(s) for \"{query}\" (namespace {}):\n",
+                        hits.len(),
+                        client.config().namespace
+                    );
+                    for h in &hits {
+                        out.push_str(&format!(
+                            "  {:.2}  {:>7} {} {}:{}  {}\n",
+                            h.score, h.kind, h.name, h.file, h.line, h.signature
+                        ));
+                    }
+                    return Ok(out);
+                }
                 let hits = store.search_symbols(&query)?;
                 let shown = hits.len().min(limit);
                 let mut out = format!("{} match(es) for \"{query}\":\n", hits.len());
@@ -243,6 +286,14 @@ impl McpServer {
                     "edge_reasons": dict(&store.edge_reason_counts()?),
                 });
                 value["refresh_on_call"] = json!(self.refresh);
+                if let Some(client) = &self.semantic {
+                    let cfg = client.config();
+                    value["semantic"] = json!({
+                        "url": cfg.url,
+                        "namespace": cfg.namespace,
+                        "domain": cfg.domain,
+                    });
+                }
                 let mut text = serde_json::to_string_pretty(&value)?;
                 text.push('\n');
                 text
@@ -294,8 +345,9 @@ fn tools() -> Value {
             "search_symbols",
             "Find indexed symbols whose name contains the query (case-insensitive): fns, structs, enums, traits, impls, mods.",
             json!({
-                "query": { "type": "string", "description": "Substring of a symbol name" },
-                "limit": { "type": "integer", "minimum": 1, "description": "Max results (default 50)" }
+                "query": { "type": "string", "description": "Substring of a symbol name, or a natural-language description in semantic mode" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Max results (default 50)" },
+                "mode": { "type": "string", "enum": ["lexical", "semantic"], "description": "lexical = name substring (default); semantic = recall from the dedicated YantrikDB code instance (needs --semantic)" }
             }),
             json!(["query"])
         ),
@@ -346,17 +398,29 @@ fn tools() -> Value {
 
 /// Serve MCP over stdin/stdout until EOF. Indexes the root once at
 /// startup so the first answer is about real data.
-pub fn run_stdio(root: PathBuf, refresh: bool) -> Result<()> {
-    let server = McpServer::new(root, refresh);
+pub fn run_stdio(root: PathBuf, refresh: bool, semantic: bool) -> Result<()> {
+    let server = McpServer::new(root, refresh, semantic);
     let stats = crate::index(&server.root)?;
     eprintln!(
-        "codeindex MCP: root={}, {} file(s), {} symbols, {} edges; per-call refresh: {}",
+        "codeindex MCP: root={}, {} file(s), {} symbols, {} edges; per-call refresh: {}; semantic: {}",
         server.root.display(),
         stats.files_seen,
         stats.symbols,
         stats.edges,
-        if server.refresh { "on" } else { "off" }
+        if server.refresh { "on" } else { "off" },
+        match &server.semantic {
+            Some(c) => format!("{} (namespace {})", c.config().url, c.config().namespace),
+            None => "off".to_string(),
+        }
     );
+    if let Some(client) = &server.semantic {
+        let store = server.store()?;
+        let synced = yantrik::sync(&store, client)?;
+        eprintln!(
+            "codeindex: semantic sync at startup — {} pushed, {} present, {} forgotten",
+            synced.pushed, synced.existing, synced.forgotten
+        );
+    }
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -394,7 +458,7 @@ mod tests {
         )
         .unwrap();
         crate::index(dir.path()).unwrap();
-        let server = McpServer::new(dir.path().to_path_buf(), false);
+        let server = McpServer::new(dir.path().to_path_buf(), false, false);
         (dir, server)
     }
 
