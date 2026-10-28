@@ -11,7 +11,9 @@
 - `docker-compose.yantrik-code.yml` — сервис `yantrikdb-code`, порт
   127.0.0.1:7442, `data-code/`, конфиг `yantrikdb-code.toml`.
 - `yantrikdb-code.toml` — `[maintenance] enabled = false`,
-  consolidation/decay раз в 10 лет; эмбеддер builtin 384d.
+  consolidation/decay раз в 10 лет; `strategy = "client_only"` —
+  векторы присылает codeindex (Ollama `bge-m3`, 1024d), инстанс только
+  хранит их.
 
 ## Первый запуск
 
@@ -31,6 +33,8 @@ CODEINDEX_YANTRIK_URL=http://127.0.0.1:7442
 CODEINDEX_YANTRIK_TOKEN=ydb_…
 CODEINDEX_YANTRIK_NAMESPACE=codeindex
 CODEINDEX_YANTRIK_DOMAIN=code
+CODEINDEX_EMBED_URL=http://127.0.0.1:11434
+CODEINDEX_EMBED_MODEL=bge-m3
 ```
 
 ## Использование

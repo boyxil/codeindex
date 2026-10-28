@@ -136,12 +136,16 @@ impl McpServer {
                     stats.parsed, stats.symbols, stats.edges
                 );
                 if let Some(client) = &self.semantic {
-                    let store = self.store()?;
-                    let synced = yantrik::sync(&store, client)?;
-                    eprintln!(
-                        "codeindex: semantic sync — {} pushed, {} present, {} forgotten",
-                        synced.pushed, synced.existing, synced.forgotten
-                    );
+                    // A semantic hiccup (embedder down, instance restarting)
+                    // must not break lexical answers: the SQLite index is
+                    // local and fresh regardless.
+                    match self.store().and_then(|store| yantrik::sync(&store, client)) {
+                        Ok(synced) => eprintln!(
+                            "codeindex: semantic sync — {} pushed, {} present, {} forgotten",
+                            synced.pushed, synced.existing, synced.forgotten
+                        ),
+                        Err(e) => eprintln!("codeindex: semantic sync skipped — {e:#}"),
+                    }
                 }
             }
         }
@@ -402,6 +406,7 @@ impl McpServer {
                     "candidate": candidate,
                     "unresolved": unresolved,
                     "edge_reasons": dict(&store.edge_reason_counts()?),
+                    "embeddings": store.embedding_count()?,
                 });
                 value["refresh_on_call"] = json!(self.refresh);
                 if let Some(client) = &self.semantic {
@@ -410,6 +415,8 @@ impl McpServer {
                         "url": cfg.url,
                         "namespace": cfg.namespace,
                         "domain": cfg.domain,
+                        "embed_url": cfg.embed_url,
+                        "embed_model": cfg.embed_model,
                     });
                 }
                 let mut text = serde_json::to_string_pretty(&value)?;
@@ -720,6 +727,7 @@ fn tools() -> Value {
                     "candidate": { "type": "integer" },
                     "unresolved": { "type": "integer" },
                     "edge_reasons": { "type": "object" },
+                    "embeddings": { "type": "integer" },
                     "refresh_on_call": { "type": "boolean" },
                     "semantic": { "type": "object" }
                 },
@@ -747,12 +755,19 @@ pub fn run_stdio(root: PathBuf, refresh: bool, semantic: bool) -> Result<()> {
         }
     );
     if let Some(client) = &server.semantic {
-        let store = server.store()?;
-        let synced = yantrik::sync(&store, client)?;
-        eprintln!(
-            "codeindex: semantic sync at startup — {} pushed, {} present, {} forgotten",
-            synced.pushed, synced.existing, synced.forgotten
-        );
+        match server
+            .store()
+            .and_then(|store| yantrik::sync(&store, client))
+        {
+            Ok(synced) => eprintln!(
+                "codeindex: semantic sync at startup — {} pushed, {} present, {} forgotten",
+                synced.pushed, synced.existing, synced.forgotten
+            ),
+            Err(e) => eprintln!(
+                "codeindex: semantic sync skipped at startup — {e:#}; \
+                 lexical tools keep working, semantic search will report the error"
+            ),
+        }
     }
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();

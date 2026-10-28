@@ -575,6 +575,7 @@ fn main() -> Result<()> {
                     "candidate": candidate,
                     "unresolved": unresolved,
                     "edge_reasons": reasons,
+                    "embeddings": store.embedding_count()?,
                     "schema_version": codeindex::store::SCHEMA_VERSION,
                     "extractor_version": codeindex::store::EXTRACTOR_VERSION,
                 }))?

@@ -18,7 +18,7 @@ use std::path::Path;
 use crate::resolve::{self, EdgeRow, FileData, Resolution, SymRow};
 use crate::scopes::Scopes;
 
-pub const SCHEMA_VERSION: &str = "4";
+pub const SCHEMA_VERSION: &str = "5";
 
 /// What the extractor writes per file (symbols+edges since M2, call
 /// scopes since M3). Unlike schema_version this describes the *derived*
@@ -155,6 +155,12 @@ impl Store {
                  name TEXT NOT NULL,
                  start_line INTEGER NOT NULL,
                  end_line INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS embeddings (
+                 symbol_key TEXT PRIMARY KEY,
+                 model TEXT NOT NULL,
+                 dim INTEGER NOT NULL,
+                 vector BLOB NOT NULL
              );
              CREATE TABLE IF NOT EXISTS bindings (
                  id INTEGER PRIMARY KEY,
@@ -675,6 +681,61 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Cached embedding of one symbol, if any: `(model, vector)`.
+    pub fn embedding(&self, symbol_key: &str) -> Result<Option<(String, Vec<f32>)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT model, vector FROM embeddings WHERE symbol_key = ?1",
+                params![symbol_key],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(model, bytes)| (model, decode_vector(&bytes))))
+    }
+
+    /// Cache one symbol's embedding. The model name is stored so a model
+    /// switch invalidates old vectors instead of mixing spaces.
+    pub fn put_embedding(&self, symbol_key: &str, model: &str, vector: &[f32]) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO embeddings(symbol_key, model, dim, vector) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(symbol_key) DO UPDATE SET
+                 model = excluded.model, dim = excluded.dim, vector = excluded.vector",
+            params![
+                symbol_key,
+                model,
+                vector.len() as i64,
+                encode_vector(vector)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop cache rows that no longer belong to an indexed symbol.
+    pub fn prune_embeddings(&self, keep: &std::collections::HashSet<String>) -> Result<usize> {
+        let keys: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT symbol_key FROM embeddings")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut removed = 0;
+        for key in keys {
+            if !keep.contains(&key) {
+                self.conn
+                    .execute("DELETE FROM embeddings WHERE symbol_key = ?1", params![key])?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    pub fn embedding_count(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
     /// Every indexed symbol joined with its file path, ordered for
     /// stable output.
     pub fn symbols(&self) -> Result<Vec<IndexedSymbol>> {
@@ -803,6 +864,19 @@ fn row_to_call_ref(r: &rusqlite::Row<'_>) -> rusqlite::Result<CallRef> {
         },
         reason: r.get(5)?,
     })
+}
+
+fn encode_vector(vector: &[f32]) -> Vec<u8> {
+    vector.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn decode_vector(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect()
 }
 
 /// Minimal glob: `*` matches any run, `?` one char. Iterative with
@@ -1073,6 +1147,26 @@ mod tests {
         // Exact lookup is case-sensitive: names are code, not prose.
         assert_eq!(store.definitions("Alpha").unwrap().len(), 1);
         assert!(store.definitions("alpha").unwrap().is_empty());
+    }
+
+    #[test]
+    fn embeddings_roundtrip_and_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_tmp(dir.path());
+        store
+            .put_embedding("k1", "bge-m3", &[0.5, -1.0, 2.0])
+            .unwrap();
+        let (model, vec) = store.embedding("k1").unwrap().unwrap();
+        assert_eq!(model, "bge-m3");
+        assert_eq!(vec, vec![0.5, -1.0, 2.0]);
+        // Overwrite on model switch.
+        store.put_embedding("k1", "other", &[1.0]).unwrap();
+        assert_eq!(store.embedding("k1").unwrap().unwrap().0, "other");
+        store.put_embedding("k2", "bge-m3", &[3.0]).unwrap();
+        let keep = std::collections::HashSet::from(["k1".to_string()]);
+        assert_eq!(store.prune_embeddings(&keep).unwrap(), 1);
+        assert_eq!(store.embedding_count().unwrap(), 1);
+        assert!(store.embedding("k2").unwrap().is_none());
     }
 
     #[test]

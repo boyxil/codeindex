@@ -6,9 +6,10 @@
 data_dir = "/var/lib/yantrikdb"
 
 [embedding]
-strategy = "builtin"
-dim = 384
-model_dir = "/models/models--Qdrant--paraphrase-multilingual-MiniLM-L12-v2-onnx-Q/snapshots/faf4aa4225822f3bc6376869cb1164e8e3feedd0"
+# client_only: векторы приходят от codeindex (Ollama bge-m3, 1024d).
+# Инстанс — хранилище, не эмбеддер: качество модели выбирает клиент.
+strategy = "client_only"
+dim = 1024
 
 [maintenance]
 enabled = false

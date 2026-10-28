@@ -32,6 +32,11 @@ pub struct Config {
     pub token: String,
     pub namespace: String,
     pub domain: String,
+    /// Ollama-compatible embeddings endpoint (`/api/embed`).
+    pub embed_url: String,
+    /// Multilingual embedder; the instance runs `client_only`, so the
+    /// vectors always come from here.
+    pub embed_model: String,
 }
 
 impl Config {
@@ -53,6 +58,16 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "code".to_string()),
+            embed_url: std::env::var("CODEINDEX_EMBED_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:11434".to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            embed_model: std::env::var("CODEINDEX_EMBED_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "bge-m3".to_string()),
         })
     }
 }
@@ -306,20 +321,61 @@ impl Client {
         )
     }
 
+    /// Embed texts through the Ollama-compatible endpoint. The code
+    /// instance runs `client_only`: vectors are ours, cached in SQLite,
+    /// sent on write and read.
+    pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let request = json!({ "model": self.cfg.embed_model, "input": texts });
+        let url = format!("{}/api/embed", self.cfg.embed_url);
+        let response = self
+            .transport
+            .request("POST", &url, "", Some(&request))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "embedding service at {} failed ({e:#}); is Ollama running with model {}?",
+                    self.cfg.embed_url,
+                    self.cfg.embed_model
+                )
+            })?;
+        let arrays = response
+            .get("embeddings")
+            .and_then(|v| v.as_array())
+            .with_context(|| format!("no `embeddings` in {} response", self.cfg.embed_url))?;
+        let mut out = Vec::with_capacity(arrays.len());
+        for array in arrays {
+            let vec: Vec<f32> = array
+                .as_array()
+                .context("embedding element is not an array")?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            out.push(vec);
+        }
+        if out.len() != texts.len() {
+            bail!(
+                "embedding service returned {} vectors for {} texts",
+                out.len(),
+                texts.len()
+            );
+        }
+        Ok(out)
+    }
+
     /// Idempotent by `key`: re-sending the same key + text is a no-op,
     /// the instance answers with the existing rid.
     pub fn remember(&self, key: &str, text: &str) -> Result<()> {
-        self.remember_many(&[(key.to_string(), text.to_string())])
+        let vec = self.embed(&[text.to_string()])?.pop().unwrap_or_default();
+        self.remember_many(&[(key.to_string(), text.to_string(), vec)])
     }
 
     /// Batch form of [`Client::remember`]. The instance rejects request
     /// bodies over 64 KiB (HTTP 413), and its quota allows 10k items per
     /// call — so batches are bounded by *payload size*, not count.
-    pub fn remember_many(&self, items: &[(String, String)]) -> Result<()> {
-        const BUDGET: usize = 48 * 1024;
+    pub fn remember_many(&self, items: &[(String, String, Vec<f32>)]) -> Result<()> {
+        const BUDGET: usize = 44 * 1024;
         let mut batch: Vec<Value> = Vec::new();
         let mut size = 0usize;
-        for (key, text) in items {
+        for (key, text, vector) in items {
             let item = json!({
                 "text": text,
                 "memory_type": "semantic",
@@ -327,9 +383,11 @@ impl Client {
                 "namespace": self.cfg.namespace,
                 "domain": self.cfg.domain,
                 "idempotency_key": idempotency_key(key, text),
+                "embedding": vector,
             });
-            // Serialized item length + a little JSON framing.
-            let item_len = key.len() + text.len() + 96;
+            // Exact serialized size: a 1024-d vector's JSON is ~14 KB,
+            // and an estimate drifted past the server's 64 KiB limit.
+            let item_len = serde_json::to_string(&item)?.len() + 1;
             if !batch.is_empty() && size + item_len > BUDGET {
                 self.remember_batch(&batch)?;
                 batch.clear();
@@ -401,10 +459,13 @@ impl Client {
         Ok(out)
     }
 
-    /// Semantic recall inside the code namespace.
+    /// Semantic recall inside the code namespace. The query vector comes
+    /// from the same embedder the records were written with.
     pub fn recall(&self, query: &str, top_k: usize) -> Result<Vec<Hit>> {
+        let query_embedding = self.embed(&[query.to_string()])?.pop().unwrap_or_default();
         let body = json!({
             "query": query,
+            "query_embedding": query_embedding,
             "top_k": top_k,
             "namespace": self.cfg.namespace,
             "domain": self.cfg.domain,
@@ -498,13 +559,50 @@ pub fn sync(store: &Store, client: &Client) -> Result<SyncStats> {
         missing.push((key.clone(), memory_text(&key, row)));
     }
     stats.pushed = missing.len();
-    client.remember_many(&missing)?;
+
+    // Vectors: reuse the SQLite cache, embed only what is new for this
+    // model. The instance stores what we send (client_only).
+    let mut vectors: Vec<Option<Vec<f32>>> = missing
+        .iter()
+        .map(|(key, _)| {
+            store
+                .embedding(key)
+                .ok()
+                .flatten()
+                .filter(|(model, _)| model == &client.cfg.embed_model)
+                .map(|(_, vec)| vec)
+        })
+        .collect();
+    let pending: Vec<String> = missing
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| vectors[*i].is_none())
+        .map(|(_, (_, text))| text.clone())
+        .collect();
+    if !pending.is_empty() {
+        let fresh = client.embed(&pending)?;
+        let mut fresh = fresh.into_iter();
+        for slot in vectors.iter_mut() {
+            if slot.is_none() {
+                *slot = fresh.next();
+            }
+        }
+    }
+    let mut items: Vec<(String, String, Vec<f32>)> = Vec::with_capacity(missing.len());
+    for ((key, text), vector) in missing.into_iter().zip(vectors) {
+        let vector = vector.context("embedding missing after the batch call")?;
+        store.put_embedding(&key, &client.cfg.embed_model, &vector)?;
+        items.push((key, text, vector));
+    }
+    client.remember_many(&items)?;
     for (_, copies) in remote {
         for stale in copies {
             client.forget(&stale.rid)?;
             stats.forgotten += 1;
         }
     }
+    let keep: std::collections::HashSet<String> = rows.iter().map(symbol_key).collect();
+    store.prune_embeddings(&keep)?;
     Ok(stats)
 }
 
@@ -530,6 +628,7 @@ mod tests {
         records: RefCell<Vec<(String, String, String)>>, // rid, text, namespace
         pushes: RefCell<Vec<Value>>,
         batch_calls: Cell<usize>,
+        embed_calls: Cell<usize>,
         forgets: RefCell<Vec<String>>,
         recall: RefCell<Vec<Value>>,
     }
@@ -559,6 +658,18 @@ mod tests {
             _token: &str,
             body: Option<&Value>,
         ) -> Result<Value> {
+            if url.ends_with("/api/embed") {
+                self.state.embed_calls.set(self.state.embed_calls.get() + 1);
+                let count = body
+                    .and_then(|b| b.get("input"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let vectors: Vec<Value> = (0..count)
+                    .map(|i| json!([0.1, 0.2, 0.3, 0.4 + i as f64 * 0.01]))
+                    .collect();
+                return Ok(json!({ "embeddings": vectors }));
+            }
             let path = url.rsplit("/v1/").next().unwrap_or("");
             match (method, path) {
                 ("POST", "remember") => {
@@ -634,6 +745,8 @@ mod tests {
             token: "t".into(),
             namespace: "codeindex".into(),
             domain: "code".into(),
+            embed_url: "http://127.0.0.1:2".into(),
+            embed_model: "test-embed".into(),
         }
     }
 
@@ -736,7 +849,9 @@ mod tests {
             }
         );
 
-        // Nothing changed: nothing is pushed.
+        // Nothing changed: nothing is pushed and nothing is re-embedded.
+        let embedded_first = _state.embed_calls.get();
+        assert!(embedded_first >= 1);
         let second = sync(&store, &client).unwrap();
         assert_eq!(
             second,
@@ -746,6 +861,7 @@ mod tests {
                 forgotten: 0
             }
         );
+        assert_eq!(_state.embed_calls.get(), embedded_first);
 
         // beta disappears: its record is forgotten, alpha stays.
         store.remove_file("b.rs").unwrap();
@@ -811,8 +927,9 @@ mod tests {
         let (mock, state) = Mock::new();
         let client = Client::with_transport(cfg(), Box::new(mock));
         let pad = "x".repeat(500);
-        let items: Vec<(String, String)> =
-            (0..200).map(|i| (format!("key{i}"), pad.clone())).collect();
+        let items: Vec<(String, String, Vec<f32>)> = (0..200)
+            .map(|i| (format!("key{i}"), pad.clone(), vec![0.1, 0.2, 0.3, 0.4]))
+            .collect();
         client.remember_many(&items).unwrap();
         // 200 × ~600 B > 48 KiB budget → several requests, every item
         // still sent exactly once.
