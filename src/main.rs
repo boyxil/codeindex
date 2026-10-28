@@ -84,6 +84,16 @@ enum Command {
         /// Exact callee name.
         name: String,
     },
+    /// What this symbol calls, transitively (resolved edges only).
+    Callees {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact symbol name.
+        name: String,
+        /// Maximum callee depth.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
     /// Show who calls this symbol, transitively (resolved edges only).
     CallTree {
         /// Indexed repository root.
@@ -154,6 +164,15 @@ fn emit(json_mode: bool, value: Value, text: impl FnOnce()) {
 
 fn symbol_json(s: &codeindex::store::IndexedSymbol) -> Value {
     json!({ "kind": s.kind, "name": s.name, "file": s.file, "line": s.line })
+}
+
+fn callee_json(n: &query::CalleeNode) -> Value {
+    json!({
+        "file": n.file,
+        "line": n.line,
+        "call_line": n.call_line,
+        "children": n.children.iter().map(callee_json).collect::<Vec<_>>(),
+    })
 }
 
 fn node_json(n: &CallNode) -> Value {
@@ -412,6 +431,25 @@ fn main() -> Result<()> {
                 },
             );
         }
+        Command::Callees { path, name, depth } => {
+            let store = open(&path)?;
+            let tree = query::callee_tree(&store, &name, depth)?;
+            emit(
+                json_mode,
+                json!({
+                    "name": name,
+                    "roots": tree.iter().map(callee_json).collect::<Vec<_>>(),
+                }),
+                || {
+                    if tree.is_empty() {
+                        println!("no symbol named \"{name}\"");
+                    } else {
+                        println!("callees of \"{name}\" (resolved edges only):");
+                        print_callees(&tree, 1);
+                    }
+                },
+            );
+        }
         Command::CallTree { path, name, depth } => {
             let store = open(&path)?;
             let tree = query::call_tree(&store, &name, depth)?;
@@ -585,6 +623,19 @@ fn sync_semantic(path: &Path, json_mode: bool) -> Result<()> {
         },
     );
     Ok(())
+}
+
+fn print_callees(nodes: &[query::CalleeNode], indent: usize) {
+    for node in nodes {
+        println!(
+            "{}{}:{} (called at parent:{})",
+            "  ".repeat(indent),
+            node.file,
+            node.line,
+            node.call_line
+        );
+        print_callees(&node.children, indent + 1);
+    }
 }
 
 fn print_tree(nodes: &[CallNode], indent: usize) {

@@ -65,20 +65,65 @@ fn join(prefix: &str, name: &str) -> String {
     }
 }
 
+/// Index of the `)` matching the `(` at `open`.
+pub(crate) fn matching_paren(tokens: &[Token], src: &str, open: usize) -> Option<usize> {
+    matching(tokens, src, open, "(", ")")
+}
+
 /// Index of the `}` matching the `{` at `open`.
 pub(crate) fn matching_brace(tokens: &[Token], src: &str, open: usize) -> Option<usize> {
+    matching(tokens, src, open, "{", "}")
+}
+
+/// Index of the closing delimiter matching `open` (`open_char`/`close_char`).
+fn matching(
+    tokens: &[Token],
+    src: &str,
+    open: usize,
+    open_char: &str,
+    close_char: &str,
+) -> Option<usize> {
     let mut depth = 0i32;
     let mut j = open;
     while j < tokens.len() {
         if tokens[j].kind == Tok::Punct {
-            match text(src, &tokens[j]) {
-                "{" => depth += 1,
-                "}" => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(j);
-                    }
+            let t = text(src, &tokens[j]);
+            if t == open_char {
+                depth += 1;
+            } else if t == close_char {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
                 }
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Index after a `macro_rules! … { … }` (or `macro name(…) { … }`)
+/// definition, or `None` when the token is not one. Macro bodies are
+/// never expanded by this project, so whatever lives inside must not
+/// become an item, an import or a span.
+pub(crate) fn skip_macro(tokens: &[Token], src: &str, at: usize) -> Option<usize> {
+    let word = text(src, &tokens[at]);
+    if word != "macro_rules" && word != "macro" {
+        return None;
+    }
+    let mut skip_paren_group = word == "macro";
+    let mut j = at + 1;
+    while j < tokens.len() {
+        if tokens[j].kind == Tok::Punct {
+            match text(src, &tokens[j]) {
+                "(" if skip_paren_group => {
+                    j = matching(tokens, src, j, "(", ")")? + 1;
+                    skip_paren_group = false;
+                    continue;
+                }
+                "{" => return matching(tokens, src, j, "{", "}").map(|c| c + 1),
+                "(" => return matching(tokens, src, j, "(", ")").map(|c| c + 1),
+                ";" => return None, // a body-less `macro m();` declaration
                 _ => {}
             }
         }
@@ -99,6 +144,10 @@ fn walk(tokens: &[Token], src: &str, start: usize, end: usize, prefix: &str, out
         let tok = &tokens[i];
         if tok.kind != Tok::Ident {
             i += 1;
+            continue;
+        }
+        if let Some(after) = skip_macro(tokens, src, i) {
+            i = after.min(end);
             continue;
         }
         match text(src, tok) {

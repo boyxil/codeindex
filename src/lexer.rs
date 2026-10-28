@@ -76,11 +76,22 @@ pub fn lex(src: &str) -> Vec<Token> {
                 i += 1;
                 while i < b.len() && b[i] != b'"' {
                     if b[i] == b'\\' {
+                        // Skip the escaped character whole: a multibyte
+                        // one must not leave `i` mid-char.
                         i += 1;
-                        if i < b.len() && b[i] == b'\n' {
-                            line += 1;
+                        if i < b.len() {
+                            if b[i] == b'\n' {
+                                line += 1;
+                                i += 1;
+                            } else if src.is_char_boundary(i) {
+                                i += src[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                            } else {
+                                i += 1;
+                            }
                         }
-                    } else if b[i] == b'\n' {
+                        continue;
+                    }
+                    if b[i] == b'\n' {
                         line += 1;
                     }
                     i += 1;
@@ -141,9 +152,20 @@ pub fn lex(src: &str) -> Vec<Token> {
                         });
                     }
                 } else {
-                    i += 1;
+                    // `'` followed by neither `\` nor an ASCII ident:
+                    // a non-ASCII char literal (`'Θ'`). Consume the whole
+                    // scalar, and a closing quote when present, so the
+                    // token never ends inside a char.
+                    let ch_len = src[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    i += ch_len;
+                    let kind = if i < b.len() && b[i] == b'\'' {
+                        i += 1;
+                        Tok::Literal
+                    } else {
+                        Tok::Punct
+                    };
                     out.push(Token {
-                        kind: Tok::Punct,
+                        kind,
                         start,
                         end: i,
                         line,
@@ -262,6 +284,14 @@ pub fn lex(src: &str) -> Vec<Token> {
                 // tokens would land token bounds inside a multibyte
                 // character (e.g. `…` in code), and any later text()
                 // slice on such a token panics on the char boundary.
+                // Malformed input (stray escapes) can leave `i` inside a
+                // char; token bounds must stay on char boundaries or every
+                // later text() slice panics. Those bytes belong to the
+                // token that consumed them, so no new token is emitted.
+                if !src.is_char_boundary(i) {
+                    i += 1;
+                    continue;
+                }
                 let ch_len = src[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
                 i += ch_len;
                 out.push(Token {

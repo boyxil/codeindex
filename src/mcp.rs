@@ -31,6 +31,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "get_callers",
     "get_references",
     "call_tree",
+    "callee_tree",
     "blast_radius",
     "get_symbol",
     "stats",
@@ -325,6 +326,23 @@ impl McpServer {
                 });
                 ToolOutput { text, structured }
             }
+            "callee_tree" => {
+                let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
+                let depth = narg("depth", 3);
+                let tree = query::callee_tree(&store, &name, depth)?;
+                let text = if tree.is_empty() {
+                    format!("no symbol named \"{name}\"\n")
+                } else {
+                    let mut out = format!("callees of \"{name}\" (resolved edges only):\n");
+                    render_callees(&mut out, &tree, 1);
+                    out
+                };
+                let structured = json!({
+                    "name": name,
+                    "roots": tree.iter().map(callee_value).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
+            }
             "blast_radius" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let affected = query::blast_radius(&store, &name)?;
@@ -406,6 +424,28 @@ impl McpServer {
     }
 }
 
+fn callee_value(node: &query::CalleeNode) -> Value {
+    json!({
+        "file": node.file,
+        "line": node.line,
+        "call_line": node.call_line,
+        "children": node.children.iter().map(callee_value).collect::<Vec<_>>(),
+    })
+}
+
+fn render_callees(out: &mut String, nodes: &[query::CalleeNode], indent: usize) {
+    for node in nodes {
+        out.push_str(&format!(
+            "{}{}:{} (called at parent:{})\n",
+            "  ".repeat(indent),
+            node.file,
+            node.line,
+            node.call_line
+        ));
+        render_callees(out, &node.children, indent + 1);
+    }
+}
+
 fn node_value(node: &CallNode) -> Value {
     json!({
         "file": node.file,
@@ -438,7 +478,7 @@ fn rpc_error(id: Value, code: i64, message: String) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: Value) -> Value {
+fn tool(name: &str, description: &str, properties: Value, required: Value, output: Value) -> Value {
     json!({
         "name": name,
         "description": description,
@@ -447,11 +487,37 @@ fn tool(name: &str, description: &str, properties: Value, required: Value) -> Va
             "properties": properties,
             "required": required
         },
-        // The structured answer is an object whose exact shape is
-        // documented per tool; this schema only asserts that much so
-        // clients can rely on object access without us over-specifying
-        // every field before a client needs it.
-        "outputSchema": { "type": "object" }
+        "outputSchema": output
+    })
+}
+
+/// Schema of one `{kind, name, file, line}` record.
+fn symbol_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string" },
+            "name": { "type": "string" },
+            "file": { "type": "string" },
+            "line": { "type": "integer" }
+        },
+        "required": ["kind", "name", "file", "line"]
+    })
+}
+
+fn array_of(items: Value) -> Value {
+    json!({ "type": "array", "items": items })
+}
+
+fn tree_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "file": { "type": "string" },
+            "line": { "type": "integer" },
+            "children": { "type": "array" }
+        },
+        "required": ["file", "line", "children"]
     })
 }
 
@@ -467,19 +533,67 @@ fn tools() -> Value {
                 "kind": { "type": "string", "description": "Exact kind filter: fn, struct, enum, trait, impl, mod, union" },
                 "path": { "type": "string", "description": "Only symbols whose file path contains this substring" }
             }),
-            json!(["query"])
+            json!(["query"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["lexical", "semantic"] },
+                    "matches": array_of(symbol_schema()),
+                    "hits": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "source": { "type": "string" },
+                            "score": { "type": "number" },
+                            "kind": { "type": "string" },
+                            "name": { "type": "string" },
+                            "file": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "signature": { "type": "string" }
+                        }
+                    })),
+                    "truncated": { "type": "boolean" }
+                },
+                "required": ["query", "mode"]
+            })
         ),
         tool(
             "get_definition",
             "Exact-name definitions: file, line and kind. A name may exist in several modules; all are listed until the resolver disambiguates.",
             json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
-            json!(["name"])
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "definitions": array_of(symbol_schema())
+                },
+                "required": ["name", "definitions"]
+            })
         ),
         tool(
             "get_callers",
             "Call sites of this name with their resolution tier (resolved → target, candidate/unresolved with a reason). Never pretends a guess is a fact.",
             json!({ "name": { "type": "string", "description": "Exact callee name" } }),
-            json!(["name"])
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "callers": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "file": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "tier": { "type": "string", "enum": ["resolved", "candidate", "unresolved"] },
+                            "target": { "type": ["object", "null"] },
+                            "reason": { "type": ["string", "null"] }
+                        },
+                        "required": ["file", "line", "tier"]
+                    }))
+                },
+                "required": ["name", "callers"]
+            })
         ),
         tool(
             "get_references",
@@ -488,7 +602,24 @@ fn tools() -> Value {
                 "name": { "type": "string", "description": "Exact identifier" },
                 "limit": { "type": "integer", "minimum": 1, "description": "Max results (default 100)" }
             }),
-            json!(["name"])
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "references": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "file": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "kind": { "type": "string", "enum": ["definition", "call", "mention"] },
+                            "target": { "type": ["object", "null"] }
+                        },
+                        "required": ["file", "line", "kind"]
+                    }))
+                },
+                "required": ["name", "references"]
+            })
         ),
         tool(
             "call_tree",
@@ -497,13 +628,54 @@ fn tools() -> Value {
                 "name": { "type": "string", "description": "Exact symbol name" },
                 "depth": { "type": "integer", "minimum": 1, "description": "Max caller depth (default 3)" }
             }),
-            json!(["name"])
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "roots": array_of(tree_schema())
+                },
+                "required": ["name", "roots"]
+            })
+        ),
+        tool(
+            "callee_tree",
+            "What this symbol calls, transitively downward. Follows resolved edges only; depth-limited.",
+            json!({
+                "name": { "type": "string", "description": "Exact symbol name" },
+                "depth": { "type": "integer", "minimum": 1, "description": "Max callee depth (default 3)" }
+            }),
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "roots": array_of(tree_schema())
+                },
+                "required": ["name", "roots"]
+            })
         ),
         tool(
             "blast_radius",
             "Everything that transitively calls this symbol through resolved edges — what a change here can reach.",
             json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
-            json!(["name"])
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "affected": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "file": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "depth": { "type": "integer" }
+                        },
+                        "required": ["file", "line", "depth"]
+                    }))
+                },
+                "required": ["name", "affected"]
+            })
         ),
         tool(
             "get_symbol",
@@ -513,13 +685,46 @@ fn tools() -> Value {
                 "file": { "type": "string", "description": "Restrict to this file (exact or suffix)" },
                 "max_lines": { "type": "integer", "minimum": 1, "description": "Line cap (default 120)" }
             }),
-            json!(["name"])
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string" },
+                    "name": { "type": "string" },
+                    "file": { "type": "string" },
+                    "start": { "type": "integer" },
+                    "end": { "type": "integer" },
+                    "text": { "type": "string" },
+                    "found": { "type": "boolean" }
+                },
+                "required": ["name"]
+            })
         ),
         tool(
             "stats",
             "Index statistics: files, symbols by kind, edges by resolution tier and the reason breakdown.",
             json!({}),
-            json!([])
+            json!([]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string" },
+                    "db": { "type": "string" },
+                    "schema_version": { "type": "string" },
+                    "extractor_version": { "type": "string" },
+                    "files": { "type": "integer" },
+                    "symbols": { "type": "integer" },
+                    "symbols_by_kind": { "type": "object" },
+                    "edges": { "type": "integer" },
+                    "resolved": { "type": "integer" },
+                    "candidate": { "type": "integer" },
+                    "unresolved": { "type": "integer" },
+                    "edge_reasons": { "type": "object" },
+                    "refresh_on_call": { "type": "boolean" },
+                    "semantic": { "type": "object" }
+                },
+                "required": ["files", "symbols", "edges", "resolved", "candidate", "unresolved"]
+            })
         )
     ])
 }
@@ -626,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_exactly_the_eight_tools() {
+    fn tools_list_exposes_exactly_the_nine_tools() {
         let (_d, server) = fixture();
         let resp = call(&server, 2, "tools/list", json!({}));
         let tools = resp["result"]["tools"].as_array().unwrap();

@@ -164,6 +164,68 @@ pub fn blast_radius(store: &Store, name: &str) -> Result<Vec<Affected>> {
     Ok(out)
 }
 
+/// Downward call node: a callee definition reached from a call site.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalleeNode {
+    pub file: String,
+    /// Definition line of the callee.
+    pub line: i64,
+    /// Call site line inside the parent.
+    pub call_line: i64,
+    pub children: Vec<CalleeNode>,
+}
+
+/// What `name` calls: the mirror of [`call_tree`]. Resolved edges only;
+/// cycles are collapsed by remembering which definitions were expanded.
+pub fn callee_tree(store: &Store, name: &str, max_depth: usize) -> Result<Vec<CalleeNode>> {
+    let edges = store.edges_with_resolution()?;
+    let fns = store.function_spans()?;
+    let mut visited: HashSet<Key> = HashSet::new();
+    Ok(roots(store, name)?
+        .into_iter()
+        .map(|root| CalleeNode {
+            file: root.0.clone(),
+            line: root.1,
+            call_line: root.1,
+            children: callees_of(&edges, &fns, &root, 1, max_depth, &mut visited),
+        })
+        .collect())
+}
+
+fn callees_of(
+    edges: &[crate::store::EdgeInfo],
+    fns: &HashMap<String, Vec<(i64, i64)>>,
+    def: &Key,
+    depth: usize,
+    max_depth: usize,
+    visited: &mut HashSet<Key>,
+) -> Vec<CalleeNode> {
+    if depth > max_depth || !visited.insert(def.clone()) {
+        return Vec::new();
+    }
+    let end = fns
+        .get(&def.0)
+        .and_then(|spans| spans.iter().find(|(s, _)| *s == def.1).map(|(_, e)| *e))
+        .unwrap_or(def.1);
+    let mut out = Vec::new();
+    for edge in edges {
+        if edge.file != def.0 || edge.line <= def.1 || edge.line > end {
+            continue;
+        }
+        let Some((tf, tl)) = &edge.target else {
+            continue;
+        };
+        let child_def = (tf.clone(), *tl);
+        out.push(CalleeNode {
+            file: tf.clone(),
+            line: *tl,
+            call_line: edge.line,
+            children: callees_of(edges, fns, &child_def, depth + 1, max_depth, visited),
+        });
+    }
+    out
+}
+
 /// One lexical occurrence of a name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reference {
@@ -473,6 +535,24 @@ mod tests {
         // Depth limit stops expansion.
         let shallow = call_tree(&store, "leaf", 1).unwrap();
         assert!(shallow[0].children[0].children.is_empty());
+    }
+
+    #[test]
+    fn callee_tree_walks_downward() {
+        let (_d, store) = setup(CHAIN);
+        let tree = callee_tree(&store, "top", 3).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!((tree[0].file.as_str(), tree[0].line), ("lib.rs", 5));
+        let mid = &tree[0].children;
+        assert_eq!(mid.len(), 1);
+        assert_eq!((mid[0].file.as_str(), mid[0].line), ("lib.rs", 2));
+        assert_eq!(mid[0].call_line, 6);
+        let leaf = &mid[0].children;
+        assert_eq!(leaf.len(), 1);
+        assert_eq!((leaf[0].file.as_str(), leaf[0].line), ("lib.rs", 1));
+        assert_eq!(leaf[0].call_line, 3);
+        // A leaf has nothing below it.
+        assert!(leaf[0].children.is_empty());
     }
 
     #[test]

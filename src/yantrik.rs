@@ -109,6 +109,16 @@ pub fn symbol_key(row: &SemanticRow) -> String {
     crate::sha256_hex(material.as_bytes())[..16].to_string()
 }
 
+/// The instance refuses a key whose claim was stored with a different
+/// payload (HTTP 200 with `idempotency_conflict: true`, `stored: false`)
+/// and `forget` does not release the claim. Binding the key to a hash of
+/// the exact text makes a burned key impossible in the first place: an
+/// identical payload reuses one claim, a changed payload gets a new one.
+fn idempotency_key(core: &str, text: &str) -> String {
+    let payload = crate::sha256_hex(text.as_bytes());
+    format!("{core}-{}", &payload[..8])
+}
+
 /// The memory text: a machine-readable marker followed by the
 /// declaration itself. The marker makes a hit self-describing; the rest
 /// is what the embedder sees.
@@ -316,7 +326,7 @@ impl Client {
                 "importance": 0.5,
                 "namespace": self.cfg.namespace,
                 "domain": self.cfg.domain,
-                "idempotency_key": key,
+                "idempotency_key": idempotency_key(key, text),
             });
             // Serialized item length + a little JSON framing.
             let item_len = key.len() + text.len() + 96;
@@ -465,26 +475,35 @@ pub fn hybrid_search(
 /// missing, forget what no longer exists. Foreign records are untouched.
 pub fn sync(store: &Store, client: &Client) -> Result<SyncStats> {
     let rows = store.semantic_rows()?;
-    let mut remote: HashMap<String, Remote> = client
-        .list()?
-        .into_iter()
-        .filter_map(|r| r.key.clone().map(|k| (k, r)))
-        .collect();
+    // One marker key may own several records when the payload format or
+    // the idempotency scheme changed; one copy survives, the rest go.
+    let mut remote: HashMap<String, Vec<Remote>> = HashMap::new();
+    for record in client.list()? {
+        if let Some(key) = &record.key {
+            remote.entry(key.clone()).or_default().push(record);
+        }
+    }
     let mut stats = SyncStats::default();
     let mut missing: Vec<(String, String)> = Vec::new();
     for row in &rows {
         let key = symbol_key(row);
-        if remote.remove(&key).is_some() {
+        if let Some(mut copies) = remote.remove(&key) {
             stats.existing += 1;
+            for stale in copies.split_off(1) {
+                client.forget(&stale.rid)?;
+                stats.forgotten += 1;
+            }
             continue;
         }
         missing.push((key.clone(), memory_text(&key, row)));
     }
     stats.pushed = missing.len();
     client.remember_many(&missing)?;
-    for (_, stale) in remote {
-        client.forget(&stale.rid)?;
-        stats.forgotten += 1;
+    for (_, copies) in remote {
+        for stale in copies {
+            client.forget(&stale.rid)?;
+            stats.forgotten += 1;
+        }
     }
     Ok(stats)
 }
@@ -653,6 +672,18 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_keys_are_bound_to_the_payload() {
+        let key = "0123456789abcdef";
+        let a = idempotency_key(key, "text one");
+        let b = idempotency_key(key, "text one");
+        let c = idempotency_key(key, "text two");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("0123456789abcdef-"));
+        assert_eq!(a.len(), 16 + 1 + 8);
+    }
+
+    #[test]
     fn keys_are_content_addressed() {
         let a = row("src/a.rs", "f", 1, "fn f() {}");
         let b = row("src/a.rs", "f", 1, "fn f(x: u8) {}");
@@ -680,6 +711,7 @@ mod tests {
                 &[symbol("alpha", "a.rs", 1, "fn alpha() {}")],
                 &[],
                 &scopes,
+                &[],
             )
             .unwrap();
         store
@@ -691,6 +723,7 @@ mod tests {
                 &[symbol("beta", "b.rs", 2, "fn beta() {}")],
                 &[],
                 &scopes,
+                &[],
             )
             .unwrap();
         let first = sync(&store, &client).unwrap();
@@ -725,6 +758,52 @@ mod tests {
                 forgotten: 1
             }
         );
+    }
+
+    #[test]
+    fn sync_forgets_duplicate_records_for_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.db")).unwrap();
+        let row = row("a.rs", "alpha", 1, "fn alpha() {}");
+        store
+            .replace_file(
+                "a.rs",
+                "h",
+                1,
+                "crate::a",
+                &[symbol("alpha", "a.rs", 1, "fn alpha() {}")],
+                &[],
+                &crate::scopes::Scopes::default(),
+                &[],
+            )
+            .unwrap();
+        let key = symbol_key(&row);
+        let (mock, state) = Mock::new();
+        {
+            // Two records carry the same marker key: an old payload format
+            // plus the current one.
+            let mut records = state.records.borrow_mut();
+            records.push((
+                "rid-old".into(),
+                memory_text(&key, &row),
+                "codeindex".into(),
+            ));
+            records.push((
+                "rid-new".into(),
+                memory_text(&key, &row),
+                "codeindex".into(),
+            ));
+        }
+        let client = Client::with_transport(cfg(), Box::new(mock));
+        let stats = sync(&store, &client).unwrap();
+        assert_eq!(stats.existing, 1);
+        assert_eq!(stats.pushed, 0);
+        assert_eq!(stats.forgotten, 1);
+        let forgets = state.forgets.borrow();
+        assert_eq!(forgets.len(), 1);
+        assert!(forgets[0] == "rid-old" || forgets[0] == "rid-new");
+        // Exactly one copy of the key is left.
+        assert_eq!(state.records.borrow().len(), 1);
     }
 
     #[test]
@@ -783,6 +862,7 @@ mod tests {
                 &[symbol("alpha", "a.rs", 1, "fn alpha() {}")],
                 &[],
                 &crate::scopes::Scopes::default(),
+                &[],
             )
             .unwrap();
         let (mock, state) = Mock::new();

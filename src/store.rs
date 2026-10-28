@@ -18,13 +18,13 @@ use std::path::Path;
 use crate::resolve::{self, EdgeRow, FileData, Resolution, SymRow};
 use crate::scopes::Scopes;
 
-pub const SCHEMA_VERSION: &str = "3";
+pub const SCHEMA_VERSION: &str = "4";
 
 /// What the extractor writes per file (symbols+edges since M2, call
 /// scopes since M3). Unlike schema_version this describes the *derived*
 /// data: bumping it makes stored hashes stale as parse decisions, so the
 /// next index run re-parses everything once.
-pub const EXTRACTOR_VERSION: &str = "7";
+pub const EXTRACTOR_VERSION: &str = "8";
 
 /// One indexed symbol joined with its file — the read API M2 queries
 /// grow from.
@@ -126,6 +126,7 @@ impl Store {
                  src_line INTEGER NOT NULL,
                  callee TEXT NOT NULL,
                  qualifier TEXT,
+                 receiver TEXT,
                  call_kind TEXT NOT NULL,
                  tier TEXT NOT NULL,
                  resolved_file_id INTEGER REFERENCES files(id),
@@ -155,6 +156,15 @@ impl Store {
                  start_line INTEGER NOT NULL,
                  end_line INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS bindings (
+                 id INTEGER PRIMARY KEY,
+                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 fn_line INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 type_name TEXT NOT NULL,
+                 line INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_bindings_file ON bindings(file_id);
              CREATE TABLE IF NOT EXISTS imports (
                  id INTEGER PRIMARY KEY,
                  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -214,6 +224,7 @@ impl Store {
         symbols: &[super::Symbol],
         calls: &[super::CallSite],
         scopes: &Scopes,
+        bindings: &[crate::resolve::LocalBinding],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -226,7 +237,9 @@ impl Store {
             tx.query_row("SELECT id FROM files WHERE path = ?1", params![path], |r| {
                 r.get(0)
             })?;
-        for table in ["symbols", "edges", "modules", "impls", "traits", "imports"] {
+        for table in [
+            "symbols", "edges", "modules", "impls", "traits", "imports", "bindings",
+        ] {
             let column = if table == "edges" {
                 "src_file_id"
             } else {
@@ -256,8 +269,8 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO edges(
-                     src_file_id, src_line, callee, qualifier, call_kind, tier
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     src_file_id, src_line, callee, qualifier, receiver, call_kind, tier
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for c in calls {
                 stmt.execute(params![
@@ -265,6 +278,7 @@ impl Store {
                     c.line as i64,
                     c.callee,
                     c.qualifier,
+                    c.receiver,
                     call_kind_name(c.kind),
                     resolve::TIER_CANDIDATE
                 ])?;
@@ -319,6 +333,15 @@ impl Store {
             )?;
             for u in &scopes.uses {
                 stmt.execute(params![file_id, u.path, u.alias, u.glob, u.line as i64])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO bindings(file_id, fn_line, name, type_name, line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for b in bindings {
+                stmt.execute(params![file_id, b.fn_line, b.name, b.type_name, b.line])?;
             }
         }
         tx.commit()?;
@@ -476,14 +499,34 @@ impl Store {
                 files[idx].uses.push(decl);
             }
         }
+        let mut binding_rows = self
+            .conn
+            .prepare("SELECT file_id, fn_line, name, type_name, line FROM bindings")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    crate::resolve::LocalBinding {
+                        fn_line: r.get(1)?,
+                        name: r.get(2)?,
+                        type_name: r.get(3)?,
+                        line: r.get(4)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (file_id, binding) in binding_rows.drain(..) {
+            if let Some(&idx) = index_of.get(&file_id) {
+                files[idx].bindings.push(binding);
+            }
+        }
         Ok(files)
     }
 
     /// Every call edge, without resolution fields.
     pub fn all_edges(&self) -> Result<Vec<EdgeRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, src_file_id, src_line, callee, qualifier, call_kind FROM edges")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, src_file_id, src_line, callee, qualifier, receiver, call_kind FROM edges",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(EdgeRow {
                 id: r.get(0)?,
@@ -491,7 +534,8 @@ impl Store {
                 src_line: r.get(2)?,
                 callee: r.get(3)?,
                 qualifier: r.get(4)?,
-                call_kind: r.get(5)?,
+                receiver: r.get(5)?,
+                call_kind: r.get(6)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -662,11 +706,21 @@ impl Store {
         kind: Option<&str>,
         path: Option<&str>,
     ) -> Result<Vec<IndexedSymbol>> {
+        // `*`/`?` switch to glob matching on the name (case-sensitive:
+        // patterns describe code); otherwise substring, case-insensitive.
+        let glob = query.contains('*') || query.contains('?');
         let needle = query.to_lowercase();
+        let matches = |name: &str| {
+            if glob {
+                glob_match(query, name)
+            } else {
+                name.to_lowercase().contains(&needle)
+            }
+        };
         Ok(self
             .symbols()?
             .into_iter()
-            .filter(|s| s.name.to_lowercase().contains(&needle))
+            .filter(|s| matches(&s.name))
             .filter(|s| kind.is_none_or(|k| s.kind == k))
             .filter(|s| path.is_none_or(|p| s.file.contains(p)))
             .collect())
@@ -751,6 +805,35 @@ fn row_to_call_ref(r: &rusqlite::Row<'_>) -> rusqlite::Result<CallRef> {
     })
 }
 
+/// Minimal glob: `*` matches any run, `?` one char. Iterative with
+/// backtracking, no recursion.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 fn call_kind_name(kind: super::CallKind) -> &'static str {
     match kind {
         super::CallKind::Plain => "plain",
@@ -783,6 +866,7 @@ mod tests {
         super::super::CallSite {
             callee: name.to_string(),
             qualifier: None,
+            receiver: None,
             kind: super::super::CallKind::Plain,
             line,
         }
@@ -828,6 +912,7 @@ mod tests {
                 &[sym("f", "fn"), sym("g", "fn")],
                 &[call("q", 2)],
                 &Scopes::default(),
+                &[],
             )
             .unwrap();
         // Same path, changed content: rows replaced wholesale.
@@ -840,6 +925,7 @@ mod tests {
                 &[sym("h", "fn")],
                 &[],
                 &Scopes::default(),
+                &[],
             )
             .unwrap();
         assert_eq!(store.symbol_count().unwrap(), 1);
@@ -864,6 +950,7 @@ mod tests {
                 &[sym("f", "fn")],
                 &[call("q", 2)],
                 &Scopes::default(),
+                &[],
             )
             .unwrap();
         store.remove_file("a.rs").unwrap();
@@ -885,6 +972,7 @@ mod tests {
                 &[sym("target", "fn")],
                 &[],
                 &Scopes::default(),
+                &[],
             )
             .unwrap();
         store
@@ -896,6 +984,7 @@ mod tests {
                 &[],
                 &[call("target", 3), call("target", 3), call("other", 4)],
                 &Scopes::default(),
+                &[],
             )
             .unwrap();
         let b_id = store
@@ -943,10 +1032,18 @@ mod tests {
                 &[sym("Alpha", "fn"), sym("alphabet", "fn")],
                 &[],
                 &Scopes::default(),
+                &[],
             )
             .unwrap();
         let hits = store.search_symbols("ALP", None, None).unwrap();
         assert_eq!(hits.len(), 2);
+        // Glob patterns match the whole name, case-sensitively.
+        assert_eq!(store.search_symbols("Al*", None, None).unwrap().len(), 1);
+        assert_eq!(store.search_symbols("*pha", None, None).unwrap().len(), 1);
+        assert_eq!(store.search_symbols("Al?ha", None, None).unwrap().len(), 1);
+        // Case matters for patterns: `alphabet` starts with "al".
+        assert_eq!(store.search_symbols("AL*", None, None).unwrap().len(), 0);
+        assert_eq!(store.search_symbols("al*", None, None).unwrap().len(), 1);
         // Kind and path filters narrow without touching the match.
         assert_eq!(
             store.search_symbols("alp", Some("fn"), None).unwrap().len(),

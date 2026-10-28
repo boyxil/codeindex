@@ -44,6 +44,21 @@ pub struct SymRow {
     pub end_line: i64,
 }
 
+/// A local binding with a known type inside one function: a parameter
+/// (`fn f(col: &Store)`) or an annotated `let` (`let c: Store = ...`).
+/// It is what turns `x.method()` into a resolvable target without type
+/// inference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalBinding {
+    /// Start line of the enclosing fn.
+    pub fn_line: i64,
+    pub name: String,
+    /// Base type name (`&mut Vec<u8>` → `Vec`).
+    pub type_name: String,
+    /// Line where the binding is introduced (latest wins).
+    pub line: i64,
+}
+
 /// Everything the resolver needs to know about one indexed file.
 #[derive(Debug, Default, Clone)]
 pub struct FileData {
@@ -55,6 +70,7 @@ pub struct FileData {
     pub impl_spans: Vec<ImplSpan>,
     pub trait_spans: Vec<TraitSpan>,
     pub uses: Vec<UseDecl>,
+    pub bindings: Vec<LocalBinding>,
 }
 
 /// One call edge as stored (resolution fields excluded).
@@ -65,7 +81,9 @@ pub struct EdgeRow {
     pub src_line: i64,
     pub callee: String,
     pub qualifier: Option<String>,
-    /// `plain` | `method` | `path`
+    /// Receiver identifier for method calls (`x` in `x.foo()`).
+    pub receiver: Option<String>,
+    /// `plain` | `method` | `self_method` | `path`
     pub call_kind: String,
 }
 
@@ -139,6 +157,9 @@ struct FileCtx {
     module: String,
     spans: Vec<ModuleSpan>,
     impls: Vec<ImplSpan>,
+    /// fn spans (start, end) — used to find the enclosing fn of a call.
+    fns: Vec<(i64, i64)>,
+    bindings: Vec<LocalBinding>,
 }
 
 pub struct Resolver {
@@ -244,12 +265,20 @@ impl Resolver {
                 let module = deepen(&f.module, &f.module_spans, u.line as i64);
                 program.imports.entry(module).or_default().push(u.clone());
             }
+            let fns = f
+                .symbols
+                .iter()
+                .filter(|s| s.kind == "fn")
+                .map(|s| (s.line, s.end_line))
+                .collect();
             ctx.insert(
                 f.file_id,
                 FileCtx {
                     module: f.module,
                     spans: f.module_spans,
                     impls: f.impl_spans,
+                    fns,
+                    bindings: f.bindings,
                 },
             );
         }
@@ -267,7 +296,7 @@ impl Resolver {
         };
         let module = deepen(&ctx.module, &ctx.spans, edge.src_line);
         match edge.call_kind.as_str() {
-            "method" => candidate(R_METHOD),
+            "method" => self.resolve_method(&module, edge),
             // `self.foo()` has a known receiver: the enclosing impl's
             // type. Outside an impl the code does not compile, so the
             // edge stays an honest candidate there.
@@ -283,6 +312,60 @@ impl Resolver {
                 None => self.resolve_plain(&module, &edge.callee),
             },
             _ => self.resolve_plain(&module, &edge.callee),
+        }
+    }
+
+    /// `x.foo()`: the receiver's declared type (parameter or annotated
+    /// `let`) picks a local type, whose impls (or, for `dyn Trait`, the
+    /// trait's methods) are searched. External types stay candidates —
+    /// std is not indexed, and guessing would be dishonest.
+    fn resolve_method(&self, module: &str, edge: &EdgeRow) -> Resolution {
+        let Some(ctx) = self.files.get(&edge.src_file_id) else {
+            return candidate(R_METHOD);
+        };
+        let Some(receiver) = &edge.receiver else {
+            return candidate(R_METHOD);
+        };
+        let Some(fn_start) = ctx
+            .fns
+            .iter()
+            .filter(|(start, end)| *start < edge.src_line && edge.src_line <= *end)
+            .max_by_key(|(start, _)| *start)
+            .map(|(start, _)| *start)
+        else {
+            return candidate(R_METHOD);
+        };
+        let Some(binding) = ctx
+            .bindings
+            .iter()
+            .filter(|b| b.fn_line == fn_start && b.name == *receiver && b.line <= edge.src_line)
+            .max_by_key(|b| b.line)
+        else {
+            return candidate(R_METHOD);
+        };
+        let type_name = if binding.type_name == "Self" {
+            match self.self_type(ctx, edge.src_line) {
+                Some(t) => t,
+                None => return candidate(R_METHOD),
+            }
+        } else {
+            binding.type_name.clone()
+        };
+        let in_scope = self
+            .lookup_name(module, &type_name)
+            .or_else(|| self.resolve_path(&type_name, module));
+        match in_scope {
+            Some(Binding::Item(it)) => {
+                let by_impl = self.resolve_in_impl(&it.name, &edge.callee);
+                if by_impl.tier != TIER_UNRESOLVED {
+                    return by_impl;
+                }
+                match self.qualified_item(&it, &edge.callee) {
+                    Some(q) => resolved((q.file_id, q.line)),
+                    None => by_impl,
+                }
+            }
+            _ => candidate(R_METHOD),
         }
     }
 
@@ -739,6 +822,58 @@ mod tests {
     }
 
     #[test]
+    fn receiver_types_from_parameters_resolve_methods() {
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "struct Store;\nimpl Store {\n    fn open(&self) {}\n}\nfn use_it(s: &Store) {\n    s.open();\n}\n",
+        )]);
+        let edge = at(&e, "lib.rs", 6);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("lib.rs".into(), 3)));
+    }
+
+    #[test]
+    fn receiver_types_from_let_annotations_resolve_methods() {
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "struct Store;\nimpl Store {\n    fn open(&self) {}\n}\nfn f() {\n    let s: Store = Store;\n    s.open();\n}\n",
+        )]);
+        let edge = at(&e, "lib.rs", 7);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("lib.rs".into(), 3)));
+    }
+
+    #[test]
+    fn dyn_trait_receivers_resolve_to_the_trait_method() {
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "trait Shape {\n    fn area(&self) -> u8;\n}\nfn measure(s: &dyn Shape) {\n    s.area();\n}\n",
+        )]);
+        let edge = at(&e, "lib.rs", 5);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("lib.rs".into(), 2)));
+    }
+
+    #[test]
+    fn shadowed_receivers_use_the_latest_binding() {
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "struct A;\nstruct B;\nimpl A {\n    fn go(&self) {}\n}\nimpl B {\n    fn go(&self) {}\n}\nfn f(x: &A) {\n    let x: B = B;\n    x.go();\n}\n",
+        )]);
+        let edge = at(&e, "lib.rs", 11);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("lib.rs".into(), 7)));
+    }
+
+    #[test]
+    fn external_receiver_types_stay_candidates() {
+        let (_d, e) = run(&[("lib.rs", "fn f(s: &str) {\n    s.len();\n}\n")]);
+        let edge = at(&e, "lib.rs", 2);
+        assert_eq!(edge.tier, TIER_CANDIDATE);
+        assert_eq!(edge.reason.as_deref(), Some(R_METHOD));
+    }
+
+    #[test]
     fn method_calls_stay_candidates_and_say_why() {
         let (_d, e) = run(&[("lib.rs", "fn f(x: &Vec<u8>) {\n    x.push(1);\n}\n")]);
         let edge = at(&e, "lib.rs", 2);
@@ -781,6 +916,17 @@ mod tests {
         let edge = at(&e, "lib.rs", 6);
         assert_eq!(edge.tier, TIER_UNRESOLVED);
         assert_eq!(edge.reason.as_deref(), Some(R_NOT_IN_SCOPE));
+    }
+
+    #[test]
+    fn sibling_crates_in_a_workspace_resolve_each_other() {
+        let (_d, e) = run(&[
+            ("a/src/lib.rs", "pub fn alpha() {}\n"),
+            ("b/src/lib.rs", "fn caller() {\n    a::alpha();\n}\n"),
+        ]);
+        let edge = at(&e, "b/src/lib.rs", 2);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("a/src/lib.rs".into(), 1)));
     }
 
     #[test]

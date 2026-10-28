@@ -67,6 +67,9 @@ pub struct CallSite {
     pub callee: String,
     /// Segment before the callee for path calls (`Foo` in `Foo::bar`).
     pub qualifier: Option<String>,
+    /// Receiver identifier for `x.foo()` — the resolver needs it to look
+    /// up `x`'s type.
+    pub receiver: Option<String>,
     pub kind: CallKind,
     /// 1-based line of the callee name token.
     pub line: usize,
@@ -120,8 +123,15 @@ const ITEM_KEYWORDS: &[(&str, ItemKind)] = &[
     ("trait", ItemKind::Named),
     ("mod", ItemKind::Named),
     ("union", ItemKind::Named),
+    ("const", ItemKind::Named),
+    ("static", ItemKind::Named),
+    ("type", ItemKind::Named),
     ("impl", ItemKind::Impl),
 ];
+
+/// Keywords whose other uses (`const N: usize` in generics) look exactly
+/// like items; they are accepted only in item position.
+const CONTEXTUAL_KEYWORDS: &[&str] = &["const", "static", "type"];
 
 #[derive(Clone, Copy)]
 enum ItemKind {
@@ -235,9 +245,18 @@ pub fn extract_calls(tokens: &[lexer::Token], src: &str) -> Vec<CallSite> {
         } else {
             (CallKind::Plain, None)
         };
+        let receiver = if kind == CallKind::Method {
+            tokens
+                .get(i - 2)
+                .filter(|t| t.kind == Tok::Ident)
+                .map(|t| text(src, t).to_string())
+        } else {
+            None
+        };
         let site = CallSite {
             callee: text(src, tok).to_string(),
             qualifier,
+            receiver,
             kind,
             line: tok.line,
         };
@@ -271,16 +290,17 @@ pub fn extract_calls(tokens: &[lexer::Token], src: &str) -> Vec<CallSite> {
 pub fn scan(root: &Path) -> anyhow::Result<Inventory> {
     let mut inv = Inventory::default();
     for file in rust_files(root) {
-        let src = match std::fs::read_to_string(&file) {
-            Ok(src) => src,
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!("codeindex: skipping {} — {e}", file.display());
                 inv.skipped += 1;
                 continue;
             }
         };
+        let src = String::from_utf8_lossy(&bytes);
         inv.files += 1;
-        extract_items(&lex(&src), &src, &file, &mut inv.symbols);
+        extract_items(&lex(&src), &src, &file, &mut inv.symbols, &mut Vec::new());
     }
     Ok(inv)
 }
@@ -357,11 +377,12 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
     let mut seen: HashSet<String> = HashSet::with_capacity(files.len());
 
     for (file, rel) in files.iter().zip(&rels) {
-        // One unreadable / non-UTF-8 file must not abort the run. The
-        // path stays "seen" so a transient read error does not wipe the
-        // rows already indexed for it.
-        let src = match std::fs::read_to_string(file) {
-            Ok(src) => src,
+        // Bytes first: the hash must see the real bytes even when the
+        // text is decoded lossily. One unreadable file must not abort the
+        // run; the path stays "seen" so a transient error does not wipe
+        // its rows.
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!("codeindex: skipping {} — {e}", file.display());
                 seen.insert(rel.clone());
@@ -369,7 +390,8 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
                 continue;
             }
         };
-        let hash = sha256_hex(src.as_bytes());
+        let hash = sha256_hex(&bytes);
+        let src = String::from_utf8_lossy(&bytes);
         seen.insert(rel.clone());
         if known.get(rel).is_some_and(|h| h == &hash) {
             stats.unchanged += 1;
@@ -386,10 +408,13 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
             .unwrap_or_else(|| "crate".to_string());
         let tokens = lex(&src);
         let mut symbols = Vec::new();
-        extract_items(&tokens, &src, file, &mut symbols);
+        let mut bindings = Vec::new();
+        extract_items(&tokens, &src, file, &mut symbols, &mut bindings);
         let calls = extract_calls(&tokens, &src);
         let scopes = scopes::extract_scopes(&tokens, &src);
-        store.replace_file(rel, &hash, mtime, &module, &symbols, &calls, &scopes)?;
+        store.replace_file(
+            rel, &hash, mtime, &module, &symbols, &calls, &scopes, &bindings,
+        )?;
         stats.parsed += 1;
     }
 
@@ -496,7 +521,11 @@ fn file_modules(
             .into_iter()
             .collect()
     } else {
-        HashMap::new()
+        // Every crate in the tree can name the others by package name.
+        roots
+            .iter()
+            .filter_map(|r| package_name(r, package_hint).map(|n| (n.clone(), n)))
+            .collect()
     };
     (modules, aliases)
 }
@@ -587,6 +616,186 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Base type name of a type expression: `&mut Vec<u8>` → `Vec`,
+/// `dyn Shape` → `Shape`, `crate::a::Store` → `Store`. Generics are
+/// skipped so a type parameter never wins over the container.
+fn type_base(tokens: &[lexer::Token], src: &str, from: usize, to: usize) -> Option<String> {
+    let mut last: Option<&str> = None;
+    let mut angle = 0i32;
+    for t in &tokens[from..to.min(tokens.len())] {
+        if t.kind == Tok::Punct {
+            match text(src, t) {
+                "<" => angle += 1,
+                ">" => angle = (angle - 1).max(0),
+                _ => {}
+            }
+        } else if t.kind == Tok::Ident && angle == 0 {
+            let word = text(src, t);
+            if !matches!(word, "mut" | "dyn" | "impl" | "const") {
+                last = Some(word);
+            }
+        }
+    }
+    last.map(str::to_string)
+}
+
+/// One parameter segment: `name: Type` at depth 0 (`&self` and patterns
+/// have no type and are skipped).
+fn parse_param(
+    tokens: &[lexer::Token],
+    src: &str,
+    from: usize,
+    to: usize,
+    fn_line: i64,
+    out: &mut Vec<resolve::LocalBinding>,
+) {
+    let mut depth = 0i32;
+    let mut j = from;
+    while j + 1 < to {
+        let t = &tokens[j];
+        if t.kind == Tok::Punct {
+            match text(src, t) {
+                "(" | "<" | "[" => depth += 1,
+                ")" | ">" | "]" => depth = (depth - 1).max(0),
+                _ => {}
+            }
+        } else if t.kind == Tok::Ident
+            && depth == 0
+            && tokens[j + 1].kind == Tok::Punct
+            && text(src, &tokens[j + 1]) == ":"
+        {
+            if let Some(type_name) = type_base(tokens, src, j + 2, to) {
+                out.push(resolve::LocalBinding {
+                    fn_line,
+                    name: text(src, t).to_string(),
+                    type_name,
+                    line: t.line as i64,
+                });
+            }
+            return;
+        }
+        j += 1;
+    }
+}
+
+/// Parameters and annotated `let`s of one fn — the raw material for
+/// resolving `x.foo()` without type inference. Only annotations we can
+/// read are recorded; anything else simply stays unknown.
+fn extract_bindings(
+    tokens: &[lexer::Token],
+    src: &str,
+    name_idx: usize,
+    open: usize,
+    close: usize,
+    fn_line: i64,
+    out: &mut Vec<resolve::LocalBinding>,
+) {
+    // Parameter list: the first `(` at angle depth 0 after the name.
+    let mut j = name_idx + 1;
+    let mut angle = 0i32;
+    let mut paren = None;
+    while j < open {
+        let t = &tokens[j];
+        if t.kind == Tok::Punct {
+            match text(src, t) {
+                "<" => angle += 1,
+                ">" => angle = (angle - 1).max(0),
+                "(" if angle == 0 => {
+                    paren = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    if let Some(po) = paren {
+        if let Some(pc) = scopes::matching_paren(tokens, src, po) {
+            let mut seg_start = po + 1;
+            let mut depth = 0i32;
+            for k in po + 1..pc {
+                let t = &tokens[k];
+                if t.kind != Tok::Punct {
+                    continue;
+                }
+                match text(src, t) {
+                    "(" | "<" | "[" => depth += 1,
+                    ")" | ">" | "]" => depth = (depth - 1).max(0),
+                    "," if depth == 0 => {
+                        parse_param(tokens, src, seg_start, k, fn_line, out);
+                        seg_start = k + 1;
+                    }
+                    _ => {}
+                }
+            }
+            parse_param(tokens, src, seg_start, pc, fn_line, out);
+        }
+    }
+    // Body: `let [mut] name: Type` — shadowing is fine, the resolver
+    // takes the latest binding before the call.
+    let mut k = open;
+    while k < close {
+        if tokens[k].kind != Tok::Ident || text(src, &tokens[k]) != "let" {
+            k += 1;
+            continue;
+        }
+        let mut n = k + 1;
+        if tokens
+            .get(n)
+            .is_some_and(|t| t.kind == Tok::Ident && text(src, t) == "mut")
+        {
+            n += 1;
+        }
+        let typed = tokens.get(n).is_some_and(|t| t.kind == Tok::Ident)
+            && tokens
+                .get(n + 1)
+                .is_some_and(|t| t.kind == Tok::Punct && text(src, t) == ":");
+        if !typed {
+            k += 1;
+            continue;
+        }
+        let mut m = n + 2;
+        let mut depth = 0i32;
+        while m < close {
+            let t = &tokens[m];
+            if t.kind == Tok::Punct {
+                match text(src, t) {
+                    "(" | "<" | "[" | "{" => depth += 1,
+                    ")" | ">" | "]" | "}" => depth = (depth - 1).max(0),
+                    "=" | ";" if depth == 0 => break,
+                    _ => {}
+                }
+            }
+            m += 1;
+        }
+        if let Some(type_name) = type_base(tokens, src, n + 2, m) {
+            out.push(resolve::LocalBinding {
+                fn_line,
+                name: text(src, &tokens[n]).to_string(),
+                type_name,
+                line: tokens[k].line as i64,
+            });
+        }
+        k = m;
+    }
+}
+
+/// Cheap positional test for contextual keywords: what precedes the
+/// token decides whether `const`/`static`/`type` starts an item.
+fn at_item_position(tokens: &[lexer::Token], src: &str, i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    match tokens[i - 1].kind {
+        Tok::Punct => matches!(text(src, &tokens[i - 1]), ";" | "{" | "}" | ")" | "]"),
+        Tok::Ident => matches!(
+            text(src, &tokens[i - 1]),
+            "pub" | "unsafe" | "extern" | "async" | "default"
+        ),
+        _ => false,
+    }
+}
+
 /// Variant names of an enum body. A variant starts after `{`, `,` or an
 /// attribute's `]` at brace depth 1; tuple/struct payloads are skipped by
 /// tracking their brackets. Discriminants (`A = 1`) do not confuse it.
@@ -652,7 +861,13 @@ fn docs_above(lines: &[&str], line: usize) -> String {
 /// Token-level item extraction. A keyword opens an item when it is not
 /// in method-call position (preceded by `.`); a `fn` inside a type like
 /// `Box<fn(u8) -> u8>` is skipped because no Ident follows the keyword.
-fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<Symbol>) {
+fn extract_items(
+    tokens: &[lexer::Token],
+    src: &str,
+    file: &Path,
+    out: &mut Vec<Symbol>,
+    bindings: &mut Vec<resolve::LocalBinding>,
+) {
     let lines: Vec<&str> = src.lines().collect();
     let signature = |line: usize| -> String {
         let decl = lines
@@ -675,6 +890,12 @@ fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<
             continue;
         }
         let word = text(src, tok);
+        // A macro body is token soup that may never be expanded: items
+        // inside it would be symbols that do not exist.
+        if let Some(after) = scopes::skip_macro(tokens, src, i) {
+            i = after;
+            continue;
+        }
         let Some((kw, kind)) = ITEM_KEYWORDS.iter().find(|(kw, _)| *kw == word) else {
             i += 1;
             continue;
@@ -686,10 +907,23 @@ fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<
             i += 1;
             continue;
         }
+        if CONTEXTUAL_KEYWORDS.contains(&word) && !at_item_position(tokens, src, i) {
+            i += 1;
+            continue;
+        }
 
         match kind {
             ItemKind::Named => {
-                let Some(next) = tokens.get(i + 1) else {
+                let mut next_idx = i + 1;
+                // `static mut NAME` — the name follows `mut`.
+                if *kw == "static"
+                    && tokens
+                        .get(next_idx)
+                        .is_some_and(|t| t.kind == Tok::Ident && text(src, t) == "mut")
+                {
+                    next_idx += 1;
+                }
+                let Some(next) = tokens.get(next_idx) else {
                     i += 1;
                     continue;
                 };
@@ -702,7 +936,7 @@ fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<
                 // `get_symbol` slices a whole item. Declarations without
                 // a body (`struct S;`, `mod m;`, trait method signatures)
                 // stay single-line.
-                let body = body_span(tokens, src, i + 2);
+                let body = body_span(tokens, src, next_idx + 1);
                 let end_line = body
                     .map(|(_, close)| tokens[close].line)
                     .unwrap_or(tok.line);
@@ -715,6 +949,19 @@ fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<
                     end_line,
                     signature: signature(tok.line),
                 });
+                if *kw == "fn" {
+                    if let Some((open, close)) = body {
+                        extract_bindings(
+                            tokens,
+                            src,
+                            next_idx,
+                            open,
+                            close,
+                            tok.line as i64,
+                            bindings,
+                        );
+                    }
+                }
                 if *kw == "enum" {
                     if let Some((open, close)) = body {
                         for variant in enum_variants(tokens, src, open, close) {
@@ -763,7 +1010,7 @@ mod tests {
     fn symbols(src: &str) -> Vec<(String, &'static str)> {
         let toks = lex(src);
         let mut out = Vec::new();
-        extract_items(&toks, src, Path::new("t.rs"), &mut out);
+        extract_items(&toks, src, Path::new("t.rs"), &mut out, &mut Vec::new());
         out.into_iter().map(|s| (s.name, s.kind)).collect()
     }
 
@@ -844,7 +1091,7 @@ mod tests {
         let src = "/// Tokenize source into tokens.\n/// Handles strings.\n#[inline]\nfn lex() {}\n\nfn plain() {}\n";
         let toks = lex(src);
         let mut out = Vec::new();
-        extract_items(&toks, src, Path::new("t.rs"), &mut out);
+        extract_items(&toks, src, Path::new("t.rs"), &mut out, &mut Vec::new());
         assert!(
             out[0].signature.contains("Tokenize source into tokens"),
             "{}",
@@ -892,7 +1139,9 @@ const S: &str = \"заявка…完成\";
 ",
         );
         let names: Vec<&str> = syms.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["f", "g"]);
+        assert!(names.contains(&"f") && names.contains(&"g"), "{names:?}");
+        // And the multibyte text in a string literal stays a literal.
+        assert!(names.contains(&"S"), "{names:?}");
     }
 
     #[test]
@@ -1045,17 +1294,73 @@ const S: &str = \"заявка…完成\";
     }
 
     #[test]
-    fn index_skips_non_utf8_files_without_aborting() {
+    fn non_utf8_files_are_indexed_lossily() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("good.rs"), "fn kept() {}\n");
-        std::fs::write(dir.path().join("bad.rs"), b"fn broken() {}\n\xff\xfe").unwrap();
+        // Latin-1 comment bytes: the file is still readable code.
+        std::fs::write(dir.path().join("bad.rs"), b"// caf\xe9\nfn broken() {}\n").unwrap();
         let s = index(dir.path()).unwrap();
         assert_eq!(s.files_seen, 2);
+        assert_eq!(s.skipped, 0);
+        assert_eq!(s.symbols, 2);
+        let store = store::Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        assert_eq!(store.file_paths().unwrap(), vec!["bad.rs", "good.rs"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_files_are_skipped_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("ok.rs"), "fn kept() {}\n");
+        let locked = dir.path().join("locked.rs");
+        write(&locked, "fn hidden() {}\n");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let s = index(dir.path()).unwrap();
+        // Clean up so the tempdir can be removed.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(s.skipped, 1);
         assert_eq!(s.symbols, 1);
-        // The unreadable file stays unknown, not half-indexed.
-        let store = store::Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
-        assert_eq!(store.file_paths().unwrap(), vec!["good.rs"]);
+    }
+
+    #[test]
+    fn contextual_keywords_only_count_in_item_position() {
+        let syms = symbols(
+            "const LIMIT: usize = 4;\nstatic mut COUNTER: u8 = 0;\ntype Alias = u8;\nfn f<const N: usize>(x: [u8; N]) {}\n",
+        );
+        let names: Vec<&str> = syms.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["LIMIT", "COUNTER", "Alias", "f"]);
+    }
+
+    #[test]
+    fn macro_bodies_do_not_produce_items_or_spans() {
+        let src = "macro_rules! make {\n    () => {\n        fn phantom() {}\n        use crate::nothing;\n    };\n}\nfn real() {}\n";
+        let syms = symbols(src);
+        assert_eq!(syms, vec![("real".into(), "fn")]);
+        let scopes = crate::scopes::extract_scopes(&lex(src), src);
+        assert!(scopes.uses.is_empty(), "{:?}", scopes.uses);
+    }
+
+    #[test]
+    fn lexer_and_extractors_never_panic_on_arbitrary_bytes() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for _ in 0..200 {
+            let mut bytes = Vec::with_capacity(96);
+            for _ in 0..96 {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                bytes.push((seed >> 33) as u8);
+            }
+            let src = String::from_utf8_lossy(&bytes);
+            let tokens = lex(&src);
+            let mut syms = Vec::new();
+            extract_items(&tokens, &src, Path::new("f.rs"), &mut syms, &mut Vec::new());
+            let _ = extract_calls(&tokens, &src);
+            let _ = crate::scopes::extract_scopes(&tokens, &src);
+            // Real consumers slice token text; that is where boundaries hurt.
+            for t in &tokens {
+                let _ = text(&src, t);
+            }
+        }
     }
 
     #[cfg(unix)]

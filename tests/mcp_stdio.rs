@@ -64,7 +64,7 @@ fn stdio_session_speaks_mcp() {
     assert_eq!(init["result"]["serverInfo"]["name"], "codeindex");
 
     // tools/list: seven tools, no notification answer (no id 0).
-    assert_eq!(by_id[&2]["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(by_id[&2]["result"]["tools"].as_array().unwrap().len(), 9);
 
     // Structured answers travel beside the text (MCP 2025-03-26+).
     assert!(by_id[&3]["result"]["structuredContent"].is_object());

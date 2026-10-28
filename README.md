@@ -14,11 +14,11 @@ tree-sitter, stack-graphs и прочих парсинг-зависимосте�
 
 | Слой | Возможность |
 |---|---|
-| M0 | Рукописный Rust-лексер + токенный сканер: `fn/struct/enum/trait/impl/mod/union`, док-блоки |
+| M0 | Рукописный Rust-лексер + токенный сканер: `fn/struct/enum/trait/impl/mod/union/const/static/type`, варианты enum, док-блоки |
 | M1 | SQLite-хранилище `.codeindex/index.db`, инкрементальная индексация по SHA-256 |
 | M2 | Места вызовов: прямые, методы, пути, турбофиш; запросы `search`/`definition`/`callers` |
-| M3 | Свой резолвер имён: модульное дерево, `use`-пути, ре-экспорты, impl-таблица, `Self::`, `self.method()`, `Trait::method`, варианты enum; `call_tree`, `blast_radius` |
-| M4 | MCP-сервер (stdio, JSON-RPC 2.0) с восемью инструментами; ответы несут `structuredContent` |
+| M3 | Свой резолвер имён: модульное дерево, `use`-пути, ре-экспорты, impl-таблица, `Self::`, `self.method()`, `Trait::method`, варианты enum, **типы получателей из параметров и `let`-аннотаций** (резолв `x.foo()`), кросс-крейтовый резолв в workspace; `call_tree`, `callee_tree`, `blast_radius` |
+| M4 | MCP-сервер (stdio, JSON-RPC 2.0) с девятью инструментами; ответы несут `structuredContent` + точные `outputSchema` |
 | M5 | Семантический поиск на **отдельном** инстансе YantrikDB (не память агента) |
 
 ## Честность рёбер
@@ -41,10 +41,11 @@ tree-sitter, stack-graphs и прочих парсинг-зависимосте�
 ```bash
 cargo build --release
 ./target/release/codeindex index .            # построить/обновить индекс
-./target/release/codeindex search . lex
+./target/release/codeindex search . lex        # подстрока; "lex*" — glob
 ./target/release/codeindex definition . Store
 ./target/release/codeindex callers . lex      # с tier и resolved-целью
 ./target/release/codeindex call-tree . lex --depth 3
+./target/release/codeindex callees . lex --depth 3
 ./target/release/codeindex blast-radius . lex
 ./target/release/codeindex symbol . lex       # исходник символа
 ./target/release/codeindex references . lex
@@ -62,8 +63,8 @@ codeindex serve /path/to/repo --no-refresh  # не переиндексиров�
 ```
 
 Инструменты: `search_symbols` (в т.ч. `mode: "semantic"`), `get_definition`,
-`get_callers`, `get_references`, `get_symbol`, `call_tree`, `blast_radius`,
-`stats`.
+`get_callers`, `get_references`, `get_symbol`, `call_tree`, `callee_tree`,
+`blast_radius`, `stats`.
 
 zcode (`~/.zcode/cli/config.json`, ключ `servers`):
 
@@ -129,16 +130,20 @@ src/yantrik.rs  семантический слой (свой мини-HTTP кл
 
 ## Известные приближения (осознанные)
 
-- Метод-вызовы без типа получателя остаются `candidate` (кроме
-  `self.foo()`); вывода типов нет.
+- Метод-вызовы резолвятся только когда тип получателя известен из
+  сигнатуры или `let`-аннотации (плюс `self.foo()`); настоящего вывода
+  типов нет — `x.foo()`, где `x` получен как результат вызова,
+  остаётся `candidate`.
 - Дерево модулей строится из раскладки файлов, а не из `mod`; файлы,
   лежащие вне объявленных модулей, всё равно индексируются.
 - Варианты enum индексируются как `Enum::Variant` (kind `variant`);
   `Trait::method(x)` и цепочки ре-экспортов (`pub use`) разрешаются.
-- Макросы не раскрываются (как и у tree-sitter).
-- Межкрейтовые вызовы в workspace не разрешаются (кроме bin → lib
-  своего крейта по имени каталога).
-- Файлы не в UTF-8 и симлинкнутые каталоги пропускаются с предупреждением.
+- Макросы не раскрываются (как и у tree-sitter); тела `macro_rules!`
+  не индексируются, чтобы не рождать несуществующие символы.
+- Крейты workspace разрешаются друг через друга по имени пакета
+  (каталога); внешние зависимости не индексируются.
+- Файлы не в UTF-8 читаются lossy (символы заменяются), нечитаемые
+  пропускаются с предупреждением; симлинкнутые каталоги не обходятся.
 
 ## Разработка
 
