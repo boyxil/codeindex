@@ -131,6 +131,29 @@ enum Command {
         #[arg(long)]
         since: String,
     },
+    /// Type/trait hierarchy: implemented traits, implementors, supertraits.
+    Hierarchy {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact type or trait name.
+        name: String,
+    },
+    /// Call chain between two symbols (resolved edges only).
+    Trace {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Starting symbol name.
+        from: String,
+        /// Target symbol name.
+        to: String,
+    },
+    /// Everything about one symbol in one answer.
+    Profile {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact symbol name.
+        name: String,
+    },
     /// Index statistics: files, symbols by kind, edges by tier and reason.
     Stats {
         /// Indexed repository root.
@@ -549,6 +572,119 @@ fn main() -> Result<()> {
                     );
                     for a in &impact.affected {
                         println!("  d{} {}:{}", a.depth, a.file, a.line);
+                    }
+                },
+            );
+        }
+        Command::Hierarchy { path, name } => {
+            let store = open(&path)?;
+            let h = query::hierarchy(&store, &name)?;
+            emit(
+                json_mode,
+                json!({
+                    "name": h.name,
+                    "kinds": h.kinds,
+                    "traits": h.traits,
+                    "implementors": h.implementors,
+                    "supertraits": h.supertraits,
+                }),
+                || {
+                    println!(
+                        "{}: {}",
+                        h.name,
+                        if h.kinds.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            h.kinds.join(", ")
+                        }
+                    );
+                    if !h.traits.is_empty() {
+                        println!("  implements: {}", h.traits.join(", "));
+                    }
+                    if !h.implementors.is_empty() {
+                        println!("  implemented by: {}", h.implementors.join(", "));
+                    }
+                    if !h.supertraits.is_empty() {
+                        println!("  supertraits: {}", h.supertraits.join(", "));
+                    }
+                },
+            );
+        }
+        Command::Trace { path, from, to } => {
+            let store = open(&path)?;
+            let steps = query::trace_path(&store, &from, &to)?;
+            emit(
+                json_mode,
+                json!({
+                    "from": from,
+                    "to": to,
+                    "path": steps.as_ref().map(|steps| steps.iter().map(|s| json!({
+                        "file": s.file,
+                        "line": s.line,
+                        "via": s.via.as_ref().map(|(f, l)| json!({"file": f, "line": l})),
+                    })).collect::<Vec<_>>()),
+                }),
+                || match &steps {
+                    None => println!("no resolved call chain from \"{from}\" to \"{to}\"",),
+                    Some(steps) => {
+                        println!(
+                            "call chain \"{from}\" → \"{to}\" ({} hop(s)):",
+                            steps.len().saturating_sub(1)
+                        );
+                        for (i, step) in steps.iter().enumerate() {
+                            match &step.via {
+                                Some((f, l)) => println!(
+                                    "  → {}:{}  (called at {}:{})",
+                                    step.file, step.line, f, l
+                                ),
+                                None => println!("  {}:{}", step.file, step.line),
+                            }
+                            let _ = i;
+                        }
+                    }
+                },
+            );
+        }
+        Command::Profile { path, name } => {
+            let store = open(&path)?;
+            let p = query::profile(&store, &path, &name)?;
+            emit(
+                json_mode,
+                json!({
+                    "name": p.name,
+                    "definitions": p.definitions.iter().map(symbol_json).collect::<Vec<_>>(),
+                    "callers": { "resolved": p.callers.0, "candidate": p.callers.1, "unresolved": p.callers.2 },
+                    "callees": p.callees.iter().map(|(f, l)| json!({"file": f, "line": l})).collect::<Vec<_>>(),
+                    "references": { "total": p.references.0, "by_kind": p.references.1 },
+                    "hierarchy": { "kinds": p.hierarchy.kinds, "traits": p.hierarchy.traits,
+                                   "implementors": p.hierarchy.implementors, "supertraits": p.hierarchy.supertraits },
+                }),
+                || {
+                    println!("{} ({} definition(s))", p.name, p.definitions.len());
+                    for d in &p.definitions {
+                        println!("  {:>7} {}:{}", d.kind, d.file, d.line);
+                    }
+                    println!(
+                        "  callers: {} resolved, {} candidate, {} unresolved",
+                        p.callers.0, p.callers.1, p.callers.2
+                    );
+                    if !p.callees.is_empty() {
+                        let list: Vec<String> =
+                            p.callees.iter().map(|(f, l)| format!("{f}:{l}")).collect();
+                        println!("  calls: {}", list.join(", "));
+                    }
+                    let kinds: Vec<String> = p
+                        .references
+                        .1
+                        .iter()
+                        .map(|(k, v)| format!("{k} {v}"))
+                        .collect();
+                    println!("  references: {} ({})", p.references.0, kinds.join(", "));
+                    if !p.hierarchy.traits.is_empty() {
+                        println!("  implements: {}", p.hierarchy.traits.join(", "));
+                    }
+                    if !p.hierarchy.implementors.is_empty() {
+                        println!("  implemented by: {}", p.hierarchy.implementors.join(", "));
                     }
                 },
             );

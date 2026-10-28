@@ -985,16 +985,16 @@ fn extract_items(
                 // The implemented type is the last ident before the brace
                 // at depth 0; `scopes::impl_header` owns the generic and
                 // `where`-clause rules (`impl<T> Pair<T>` names `Pair`).
-                if let Some((name, brace)) = scopes::impl_header(tokens, src, i) {
+                if let Some(header) = scopes::impl_header(tokens, src, i) {
                     out.push(Symbol {
-                        name,
+                        name: header.type_name,
                         kind: "impl",
                         file: file.to_path_buf(),
                         line: tok.line,
                         end_line: tok.line,
                         signature: signature(tok.line),
                     });
-                    i = brace; // resume inside the impl body
+                    i = header.brace; // resume inside the impl body
                     continue;
                 }
             }

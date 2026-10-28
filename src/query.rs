@@ -335,6 +335,201 @@ pub fn references(
     Ok(out)
 }
 
+/// Type/trait hierarchy, both directions: which traits a type
+/// implements, and which types implement a trait.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hierarchy {
+    pub name: String,
+    /// Kinds found for this name (struct, enum, trait, …).
+    pub kinds: Vec<String>,
+    /// Traits implemented by this type (`impl Trait for Type`).
+    pub traits: Vec<String>,
+    /// Types implementing this trait.
+    pub implementors: Vec<String>,
+    /// Supertraits declared on this trait.
+    pub supertraits: Vec<String>,
+}
+
+pub fn hierarchy(store: &Store, name: &str) -> Result<Hierarchy> {
+    // Impl blocks are named after the type but they do not declare it;
+    // the hierarchy speaks about the declaration itself.
+    let mut kinds: Vec<String> = store
+        .definitions(name)?
+        .into_iter()
+        .map(|d| d.kind)
+        .filter(|k| k != "impl")
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    Ok(Hierarchy {
+        name: name.to_string(),
+        kinds,
+        traits: store.trait_impls_of(name)?,
+        implementors: store.implementors_of(name)?,
+        supertraits: store.supertraits_of(name)?,
+    })
+}
+
+/// One graph node on a traced path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceStep {
+    pub file: String,
+    /// Definition line.
+    pub line: i64,
+    /// Call site inside the previous step (None for the start).
+    pub via: Option<(String, i64)>,
+}
+
+/// A call chain from one symbol to another. Both directions are
+/// searched breadth-first through resolved edges only; the first
+/// meeting point wins, so the result is a shortest known chain, not a
+/// proof that no other path exists.
+pub fn trace_path(store: &Store, from: &str, to: &str) -> Result<Option<Vec<TraceStep>>> {
+    let edges = store.edges_with_resolution()?;
+    let fns = store.function_spans()?;
+
+    // def -> [(call site, callee def)]
+    let mut forward: HashMap<Key, Vec<(Key, Key)>> = HashMap::new();
+    // def -> [(call site, caller def)]
+    let mut backward: HashMap<Key, Vec<(Key, Key)>> = HashMap::new();
+    for edge in &edges {
+        let Some(target) = &edge.target else {
+            continue;
+        };
+        let site = (edge.file.clone(), edge.line);
+        let callee = (target.0.clone(), target.1);
+        if let Some(caller) = enclosing(&fns, &site) {
+            forward
+                .entry(caller.clone())
+                .or_default()
+                .push((site.clone(), callee.clone()));
+            backward.entry(callee).or_default().push((site, caller));
+        }
+    }
+
+    let starts = roots(store, from)?;
+    let goals = roots(store, to)?;
+    if starts.is_empty() || goals.is_empty() {
+        return Ok(None);
+    }
+    // Forward BFS: node -> (previous node, call site).
+    let mut parent: HashMap<Key, Option<(Key, Key)>> = HashMap::new();
+    let mut queue: VecDeque<Key> = VecDeque::new();
+    for start in &starts {
+        if parent.insert(start.clone(), None).is_none() {
+            queue.push_back(start.clone());
+        }
+    }
+    let mut meet: Option<Key> = None;
+    while let Some(node) = queue.pop_front() {
+        if goals.contains(&node) {
+            meet = Some(node);
+            break;
+        }
+        if parent.len() > 10_000 {
+            break; // bounded: a huge graph must not stall the tool
+        }
+        for (site, next) in forward.get(&node).into_iter().flatten() {
+            if !parent.contains_key(next) {
+                parent.insert(next.clone(), Some((node.clone(), site.clone())));
+                queue.push_back(next.clone());
+            }
+        }
+    }
+    let Some(meet) = meet else {
+        return Ok(None);
+    };
+
+    // Walk back to the start; then reverse into path order.
+    let mut steps: Vec<TraceStep> = Vec::new();
+    let mut cursor = meet;
+    loop {
+        match parent.get(&cursor).cloned().flatten() {
+            Some((prev, site)) => {
+                steps.push(TraceStep {
+                    file: cursor.0.clone(),
+                    line: cursor.1,
+                    via: Some(site),
+                });
+                cursor = prev;
+            }
+            None => {
+                steps.push(TraceStep {
+                    file: cursor.0.clone(),
+                    line: cursor.1,
+                    via: None,
+                });
+                break;
+            }
+        }
+    }
+    steps.reverse();
+    Ok(Some(steps))
+}
+
+/// Everything about one symbol in a single answer: definitions, caller
+/// tiers, resolved callees, lexical references and hierarchy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    pub definitions: Vec<crate::store::IndexedSymbol>,
+    pub callers: (usize, usize, usize),
+    pub callees: Vec<Key>,
+    pub references: (usize, std::collections::BTreeMap<&'static str, usize>),
+    pub hierarchy: Hierarchy,
+}
+
+pub fn profile(store: &Store, root: &std::path::Path, name: &str) -> Result<Profile> {
+    let definitions = store.definitions(name)?;
+    let mut callers = (0usize, 0usize, 0usize);
+    for r in store.callers(name)? {
+        match r.tier.as_str() {
+            crate::resolve::TIER_RESOLVED => callers.0 += 1,
+            crate::resolve::TIER_CANDIDATE => callers.1 += 1,
+            _ => callers.2 += 1,
+        }
+    }
+    // Depth-1 resolved callees of the first fn definition.
+    let edges = store.edges_with_resolution()?;
+    let fns = store.function_spans()?;
+    let mut callees: Vec<Key> = Vec::new();
+    if let Some(def) = definitions.iter().find(|d| d.kind == "fn") {
+        let end = fns
+            .get(&def.file)
+            .and_then(|spans| {
+                spans
+                    .iter()
+                    .find(|(start, _)| *start == def.line)
+                    .map(|(_, e)| *e)
+            })
+            .unwrap_or(def.line);
+        for edge in &edges {
+            if edge.file != def.file || edge.line <= def.line || edge.line > end {
+                continue;
+            }
+            if let Some((f, l)) = &edge.target {
+                let key = (f.clone(), *l);
+                if !callees.contains(&key) {
+                    callees.push(key);
+                }
+            }
+        }
+    }
+    let refs = references(store, root, name, 10_000)?;
+    let mut by_kind: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for r in &refs {
+        *by_kind.entry(r.kind).or_default() += 1;
+    }
+    Ok(Profile {
+        name: name.to_string(),
+        definitions,
+        callers,
+        callees,
+        references: (refs.len(), by_kind),
+        hierarchy: hierarchy(store, name)?,
+    })
+}
+
 /// A symbol's source slice (declaration line through the closing brace
 /// for fns, the declaration line otherwise).
 #[derive(Debug, Clone, PartialEq)]
@@ -535,6 +730,49 @@ mod tests {
         // Depth limit stops expansion.
         let shallow = call_tree(&store, "leaf", 1).unwrap();
         assert!(shallow[0].children[0].children.is_empty());
+    }
+
+    #[test]
+    fn hierarchy_reports_both_directions_and_supertraits() {
+        let (_d, store) = setup(
+            "trait Base {}\ntrait Shape: Base {\n    fn area(&self);\n}\nstruct Square;\nimpl Shape for Square {\n    fn area(&self) {}\n}\nimpl Square {\n    fn new() -> Self { Square }\n}\n",
+        );
+        let square = hierarchy(&store, "Square").unwrap();
+        assert_eq!(square.kinds, vec!["struct"]);
+        assert_eq!(square.traits, vec!["Shape"]);
+        assert!(square.implementors.is_empty());
+        let shape = hierarchy(&store, "Shape").unwrap();
+        assert_eq!(shape.kinds, vec!["trait"]);
+        assert_eq!(shape.implementors, vec!["Square"]);
+        assert_eq!(shape.supertraits, vec!["Base"]);
+        assert!(shape.traits.is_empty());
+    }
+
+    #[test]
+    fn trace_path_links_symbols_through_resolved_edges() {
+        let (_d, store) = setup(CHAIN);
+        let steps = trace_path(&store, "top", "leaf").unwrap().unwrap();
+        let defs: Vec<(&str, i64)> = steps.iter().map(|s| (s.file.as_str(), s.line)).collect();
+        assert_eq!(defs, vec![("lib.rs", 5), ("lib.rs", 2), ("lib.rs", 1)]);
+        // The middle hop records where it was called.
+        assert_eq!(steps[1].via, Some(("lib.rs".into(), 6)));
+        assert_eq!(steps[0].via, None);
+        // No path the other way round.
+        assert!(trace_path(&store, "leaf", "top").unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_answers_everything_at_once() {
+        let (dir, store) = setup(CHAIN);
+        let p = profile(&store, dir.path(), "mid").unwrap();
+        assert_eq!(p.definitions.len(), 1);
+        assert_eq!(p.definitions[0].line, 2);
+        // mid is called once (from top) and resolves.
+        assert_eq!(p.callers, (1, 0, 0));
+        assert_eq!(p.callees, vec![("lib.rs".to_string(), 1)]);
+        assert_eq!(p.references.0, 2); // definition + call
+        assert_eq!(p.references.1.get("definition"), Some(&1));
+        assert_eq!(p.references.1.get("call"), Some(&1));
     }
 
     #[test]

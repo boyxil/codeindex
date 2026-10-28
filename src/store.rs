@@ -18,13 +18,13 @@ use std::path::Path;
 use crate::resolve::{self, EdgeRow, FileData, Resolution, SymRow};
 use crate::scopes::Scopes;
 
-pub const SCHEMA_VERSION: &str = "5";
+pub const SCHEMA_VERSION: &str = "6";
 
 /// What the extractor writes per file (symbols+edges since M2, call
 /// scopes since M3). Unlike schema_version this describes the *derived*
 /// data: bumping it makes stored hashes stale as parse decisions, so the
 /// next index run re-parses everything once.
-pub const EXTRACTOR_VERSION: &str = "8";
+pub const EXTRACTOR_VERSION: &str = "9";
 
 /// One indexed symbol joined with its file — the read API M2 queries
 /// grow from.
@@ -97,6 +97,32 @@ impl Store {
         // runs. Wait instead of failing with "database is locked".
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
 
+        // Version check first: running DDL against an older layout would
+        // fail halfway (e.g. an index on a column that does not exist) and
+        // report SQL noise instead of the actionable message.
+        let has_meta: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        let stored: Option<String> = if has_meta {
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        match stored {
+            Some(v) if v != SCHEMA_VERSION => bail!(
+                "index schema version {v} but this build expects {SCHEMA_VERSION}; \
+                 remove the .codeindex directory and re-index"
+            ),
+            _ => {}
+        }
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (
                  key TEXT PRIMARY KEY,
@@ -146,13 +172,17 @@ impl Store {
                  id INTEGER PRIMARY KEY,
                  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                  type_name TEXT NOT NULL,
+                 trait_name TEXT,
                  start_line INTEGER NOT NULL,
                  end_line INTEGER NOT NULL
              );
+             CREATE INDEX IF NOT EXISTS idx_impls_type ON impls(type_name);
+             CREATE INDEX IF NOT EXISTS idx_impls_trait ON impls(trait_name);
              CREATE TABLE IF NOT EXISTS traits (
                  id INTEGER PRIMARY KEY,
                  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                  name TEXT NOT NULL,
+                 supertraits TEXT NOT NULL,
                  start_line INTEGER NOT NULL,
                  end_line INTEGER NOT NULL
              );
@@ -180,25 +210,11 @@ impl Store {
                  line INTEGER NOT NULL
              );",
         )?;
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match stored {
-            None => {
-                conn.execute(
-                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
-                    params![SCHEMA_VERSION],
-                )?;
-            }
-            Some(v) if v == SCHEMA_VERSION => {}
-            Some(v) => bail!(
-                "index schema version {v} but this build expects {SCHEMA_VERSION}; \
-                 remove the .codeindex directory and re-index"
-            ),
+        if stored.is_none() {
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+                params![SCHEMA_VERSION],
+            )?;
         }
         Ok(Store { conn })
     }
@@ -306,13 +322,14 @@ impl Store {
         }
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO impls(file_id, type_name, start_line, end_line)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO impls(file_id, type_name, trait_name, start_line, end_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for i in &scopes.impls {
                 stmt.execute(params![
                     file_id,
                     i.type_name,
+                    i.trait_name,
                     i.start_line as i64,
                     i.end_line as i64
                 ])?;
@@ -320,13 +337,14 @@ impl Store {
         }
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO traits(file_id, name, start_line, end_line)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO traits(file_id, name, supertraits, start_line, end_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for t in &scopes.traits {
                 stmt.execute(params![
                     file_id,
                     t.name,
+                    t.supertraits.join(","),
                     t.start_line as i64,
                     t.end_line as i64
                 ])?;
@@ -449,14 +467,15 @@ impl Store {
         }
         let mut impl_rows = self
             .conn
-            .prepare("SELECT file_id, type_name, start_line, end_line FROM impls")?
+            .prepare("SELECT file_id, type_name, trait_name, start_line, end_line FROM impls")?
             .query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     crate::scopes::ImplSpan {
                         type_name: r.get(1)?,
-                        start_line: r.get::<_, i64>(2)? as usize,
-                        end_line: r.get::<_, i64>(3)? as usize,
+                        trait_name: r.get(2)?,
+                        start_line: r.get::<_, i64>(3)? as usize,
+                        end_line: r.get::<_, i64>(4)? as usize,
                     },
                 ))
             })?
@@ -468,14 +487,20 @@ impl Store {
         }
         let mut trait_rows = self
             .conn
-            .prepare("SELECT file_id, name, start_line, end_line FROM traits")?
+            .prepare("SELECT file_id, name, supertraits, start_line, end_line FROM traits")?
             .query_map([], |r| {
+                let supertraits: String = r.get(2)?;
                 Ok((
                     r.get::<_, i64>(0)?,
                     crate::scopes::TraitSpan {
                         name: r.get(1)?,
-                        start_line: r.get::<_, i64>(2)? as usize,
-                        end_line: r.get::<_, i64>(3)? as usize,
+                        supertraits: supertraits
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        start_line: r.get::<_, i64>(3)? as usize,
+                        end_line: r.get::<_, i64>(4)? as usize,
                     },
                 ))
             })?
@@ -658,6 +683,48 @@ impl Store {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Traits implemented by this type (`impl Trait for Type`).
+    pub fn trait_impls_of(&self, type_name: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT trait_name FROM impls
+             WHERE type_name = ?1 AND trait_name IS NOT NULL
+             ORDER BY trait_name",
+        )?;
+        let rows = stmt.query_map(params![type_name], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Types declaring `impl <trait_name> for …`.
+    pub fn implementors_of(&self, trait_name: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT type_name FROM impls
+             WHERE trait_name = ?1 ORDER BY type_name",
+        )?;
+        let rows = stmt.query_map(params![trait_name], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Supertraits of a trait declaration.
+    pub fn supertraits_of(&self, trait_name: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT supertraits FROM traits WHERE name = ?1")?;
+        let rows = stmt.query_map(params![trait_name], |r| r.get::<_, String>(0))?;
+        let mut out: Vec<String> = Vec::new();
+        for row in rows {
+            for part in row?.split(',') {
+                let part = part.trim();
+                if !part.is_empty() && !out.iter().any(|t| t == part) {
+                    out.push(part.to_string());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Every symbol with its declaration text — input for the semantic
@@ -971,6 +1038,32 @@ mod tests {
         conn.execute("UPDATE meta SET value = '999'", []).unwrap();
         let err = Store::open(&db).unwrap_err();
         assert!(err.to_string().contains("999"));
+    }
+
+    #[test]
+    fn old_layout_is_rejected_before_ddl_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        {
+            // An M5-era layout: no impls.trait_name column.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version', '5');
+                 CREATE TABLE impls (
+                     id INTEGER PRIMARY KEY,
+                     file_id INTEGER NOT NULL,
+                     type_name TEXT NOT NULL,
+                     start_line INTEGER NOT NULL,
+                     end_line INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+        // The version message must win over the SQL error from an index on
+        // a column the old table does not have.
+        let err = Store::open(&db).unwrap_err().to_string();
+        assert!(err.contains("schema version 5"), "{err}");
     }
 
     #[test]

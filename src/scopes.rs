@@ -17,10 +17,12 @@ pub struct ModuleSpan {
     pub end_line: usize,
 }
 
-/// An `impl` block: the implemented type and its line span.
+/// An `impl` block: the implemented type, the trait when it is a trait
+/// impl (`impl Trait for Type`), and the line span.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplSpan {
     pub type_name: String,
+    pub trait_name: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
 }
@@ -30,6 +32,8 @@ pub struct ImplSpan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitSpan {
     pub name: String,
+    /// Supertraits from the `: A + B` clause.
+    pub supertraits: Vec<String>,
     pub start_line: usize,
     pub end_line: usize,
 }
@@ -175,10 +179,11 @@ fn walk(tokens: &[Token], src: &str, start: usize, end: usize, prefix: &str, out
                 // `mod name;` — the module comes from the file layout.
             }
             "impl" => {
-                if let Some((type_name, brace)) = impl_header(tokens, src, i) {
-                    if let Some(close) = matching_brace(tokens, src, brace) {
+                if let Some(header) = impl_header(tokens, src, i) {
+                    if let Some(close) = matching_brace(tokens, src, header.brace) {
                         out.impls.push(ImplSpan {
-                            type_name,
+                            type_name: header.type_name,
+                            trait_name: header.trait_name,
                             start_line: tok.line,
                             end_line: tokens[close].line,
                         });
@@ -188,10 +193,11 @@ fn walk(tokens: &[Token], src: &str, start: usize, end: usize, prefix: &str, out
                 }
             }
             "trait" => {
-                if let Some((name, brace)) = trait_header(tokens, src, i) {
-                    if let Some(close) = matching_brace(tokens, src, brace) {
+                if let Some(header) = trait_header(tokens, src, i) {
+                    if let Some(close) = matching_brace(tokens, src, header.brace) {
                         out.traits.push(TraitSpan {
-                            name,
+                            name: header.name,
+                            supertraits: header.supertraits,
                             start_line: tok.line,
                             end_line: tokens[close].line,
                         });
@@ -218,27 +224,31 @@ fn walk(tokens: &[Token], src: &str, start: usize, end: usize, prefix: &str, out
 /// Idents count only at angle/paren depth 0, so `impl<T> Foo<T>` names
 /// `Foo` (not the generic parameter); a `where` clause ends the type
 /// search so `impl<T> Foo<T> where T: Send` cannot name `Send`.
-pub(crate) fn impl_header(tokens: &[Token], src: &str, at: usize) -> Option<(String, usize)> {
+pub(crate) struct ImplHeader {
+    pub type_name: String,
+    pub trait_name: Option<String>,
+    pub brace: usize,
+}
+
+pub(crate) fn impl_header(tokens: &[Token], src: &str, at: usize) -> Option<ImplHeader> {
     let mut depth = 0i32;
-    let mut last: Option<&Token> = None;
+    // Depth-0 idents in order: `impl <trait?> for <type>` or `impl <type>`.
+    let mut idents: Vec<&str> = Vec::new();
     let mut j = at + 1;
-    while j < tokens.len() {
-        let t = &tokens[j];
+    loop {
+        let t = tokens.get(j)?;
         match t.kind {
             Tok::Ident if depth == 0 => {
-                if text(src, t) == "where" {
+                let word = text(src, t);
+                if word == "where" {
                     while j < tokens.len()
                         && !(tokens[j].kind == Tok::Punct && text(src, &tokens[j]) == "{")
                     {
                         j += 1;
                     }
-                    return if j < tokens.len() {
-                        last.map(|t| (text(src, t).to_string(), j))
-                    } else {
-                        None
-                    };
+                    break;
                 }
-                last = Some(t);
+                idents.push(word);
             }
             Tok::Punct => match text(src, t) {
                 "<" => depth += 1,
@@ -247,30 +257,65 @@ pub(crate) fn impl_header(tokens: &[Token], src: &str, at: usize) -> Option<(Str
                 ">" => depth = (depth - 1).max(0),
                 "(" => depth += 1,
                 ")" => depth = (depth - 1).max(0),
-                "{" if depth <= 0 => return last.map(|t| (text(src, t).to_string(), j)),
+                "{" if depth <= 0 => break,
                 _ => {}
             },
             _ => {}
         }
         j += 1;
     }
-    None
+    tokens.get(j)?;
+    let type_name = idents.last()?.to_string();
+    let trait_name = idents
+        .iter()
+        .position(|w| *w == "for")
+        .filter(|k| *k > 0)
+        .map(|k| idents[k - 1].to_string());
+    Some(ImplHeader {
+        type_name,
+        trait_name,
+        brace: j,
+    })
 }
 
-fn trait_header(tokens: &[Token], src: &str, at: usize) -> Option<(String, usize)> {
+struct TraitHeader {
+    name: String,
+    supertraits: Vec<String>,
+    brace: usize,
+}
+
+fn trait_header(tokens: &[Token], src: &str, at: usize) -> Option<TraitHeader> {
     let name_tok = tokens.get(at + 1).filter(|t| t.kind == Tok::Ident)?;
     let name = text(src, name_tok).to_string();
     let mut depth = 0i32;
+    let mut in_bounds = false;
+    let mut supertraits: Vec<String> = Vec::new();
     let mut j = at + 2;
     while j < tokens.len() {
         let t = &tokens[j];
-        if t.kind == Tok::Punct {
-            match text(src, t) {
+        match t.kind {
+            Tok::Ident if depth == 0 => {
+                let word = text(src, t);
+                if word == "where" {
+                    in_bounds = false;
+                } else if in_bounds && !matches!(word, "dyn" | "mut") {
+                    supertraits.push(word.to_string());
+                }
+            }
+            Tok::Punct => match text(src, t) {
                 "<" => depth += 1,
                 ">" => depth = (depth - 1).max(0),
-                "{" if depth <= 0 => return Some((name, j)),
+                ":" if depth == 0 => in_bounds = true,
+                "{" if depth == 0 => {
+                    return Some(TraitHeader {
+                        name,
+                        supertraits,
+                        brace: j,
+                    })
+                }
                 _ => {}
-            }
+            },
+            _ => {}
         }
         j += 1;
     }
@@ -444,6 +489,32 @@ mod tests {
         assert_eq!(
             (scopes.traits[0].start_line, scopes.traits[0].end_line),
             (2, 4)
+        );
+    }
+
+    #[test]
+    fn impl_traits_and_supertraits_are_parsed() {
+        let src = "impl Display for Wrapper {}\nimpl<T> Foo<T> {}\ntrait Shape: Base + Send {\n    fn area(&self);\n}\ntrait Plain {}\n";
+        let scopes = extract_scopes(&lex(src), src);
+        let impls: Vec<(&str, Option<&str>)> = scopes
+            .impls
+            .iter()
+            .map(|i| (i.type_name.as_str(), i.trait_name.as_deref()))
+            .collect();
+        assert_eq!(impls, vec![("Wrapper", Some("Display")), ("Foo", None)]);
+        let traits: Vec<(&str, Vec<&str>)> = scopes
+            .traits
+            .iter()
+            .map(|t| {
+                (
+                    t.name.as_str(),
+                    t.supertraits.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            traits,
+            vec![("Shape", vec!["Base", "Send"]), ("Plain", vec![])]
         );
     }
 

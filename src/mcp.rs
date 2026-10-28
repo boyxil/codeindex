@@ -32,6 +32,9 @@ pub const TOOL_NAMES: &[&str] = &[
     "get_references",
     "call_tree",
     "callee_tree",
+    "get_hierarchy",
+    "trace_path",
+    "profile",
     "blast_radius",
     "get_symbol",
     "stats",
@@ -344,6 +347,129 @@ impl McpServer {
                 let structured = json!({
                     "name": name,
                     "roots": tree.iter().map(callee_value).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
+            }
+            "get_hierarchy" => {
+                let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
+                let h = query::hierarchy(&store, &name)?;
+                let mut text = format!(
+                    "{}: {}\n",
+                    h.name,
+                    if h.kinds.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        h.kinds.join(", ")
+                    }
+                );
+                if !h.traits.is_empty() {
+                    text.push_str(&format!("  implements: {}\n", h.traits.join(", ")));
+                }
+                if !h.implementors.is_empty() {
+                    text.push_str(&format!(
+                        "  implemented by: {}\n",
+                        h.implementors.join(", ")
+                    ));
+                }
+                if !h.supertraits.is_empty() {
+                    text.push_str(&format!("  supertraits: {}\n", h.supertraits.join(", ")));
+                }
+                let structured = json!({
+                    "name": h.name,
+                    "kinds": h.kinds,
+                    "traits": h.traits,
+                    "implementors": h.implementors,
+                    "supertraits": h.supertraits,
+                });
+                ToolOutput { text, structured }
+            }
+            "trace_path" => {
+                let from = sarg("from").ok_or_else(|| anyhow::anyhow!("missing `from`"))?;
+                let to = sarg("to").ok_or_else(|| anyhow::anyhow!("missing `to`"))?;
+                let steps = query::trace_path(&store, &from, &to)?;
+                let text = match &steps {
+                    None => format!("no resolved call chain from \"{from}\" to \"{to}\"\n"),
+                    Some(steps) => {
+                        let mut out = format!(
+                            "call chain \"{from}\" → \"{to}\" ({} hop(s)):\n",
+                            steps.len().saturating_sub(1)
+                        );
+                        for step in steps {
+                            match &step.via {
+                                Some((f, l)) => out.push_str(&format!(
+                                    "  → {}:{}  (called at {}:{})\n",
+                                    step.file, step.line, f, l
+                                )),
+                                None => out.push_str(&format!("  {}:{}\n", step.file, step.line)),
+                            }
+                        }
+                        out
+                    }
+                };
+                let structured = json!({
+                    "from": from,
+                    "to": to,
+                    "path": steps.as_ref().map(|steps| steps.iter().map(|s| json!({
+                        "file": s.file,
+                        "line": s.line,
+                        "via": s.via.as_ref().map(|(f, l)| json!({"file": f, "line": l})),
+                    })).collect::<Vec<_>>()),
+                });
+                ToolOutput { text, structured }
+            }
+            "profile" => {
+                let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
+                let p = query::profile(&store, &self.root, &name)?;
+                let mut text = format!("{} ({} definition(s)):\n", p.name, p.definitions.len());
+                for d in &p.definitions {
+                    text.push_str(&format!("  {:>7} {}:{}\n", d.kind, d.file, d.line));
+                }
+                text.push_str(&format!(
+                    "  callers: {} resolved, {} candidate, {} unresolved\n",
+                    p.callers.0, p.callers.1, p.callers.2
+                ));
+                if !p.callees.is_empty() {
+                    let list: Vec<String> =
+                        p.callees.iter().map(|(f, l)| format!("{f}:{l}")).collect();
+                    text.push_str(&format!("  calls: {}\n", list.join(", ")));
+                }
+                let kinds: Vec<String> = p
+                    .references
+                    .1
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect();
+                text.push_str(&format!(
+                    "  references: {} ({})\n",
+                    p.references.0,
+                    kinds.join(", ")
+                ));
+                if !p.hierarchy.traits.is_empty() {
+                    text.push_str(&format!(
+                        "  implements: {}\n",
+                        p.hierarchy.traits.join(", ")
+                    ));
+                }
+                if !p.hierarchy.implementors.is_empty() {
+                    text.push_str(&format!(
+                        "  implemented by: {}\n",
+                        p.hierarchy.implementors.join(", ")
+                    ));
+                }
+                let structured = json!({
+                    "name": p.name,
+                    "definitions": p.definitions.iter().map(|d| json!({
+                        "kind": d.kind, "name": d.name, "file": d.file, "line": d.line,
+                    })).collect::<Vec<_>>(),
+                    "callers": { "resolved": p.callers.0, "candidate": p.callers.1, "unresolved": p.callers.2 },
+                    "callees": p.callees.iter().map(|(f, l)| json!({"file": f, "line": l})).collect::<Vec<_>>(),
+                    "references": { "total": p.references.0, "by_kind": p.references.1 },
+                    "hierarchy": {
+                        "kinds": p.hierarchy.kinds,
+                        "traits": p.hierarchy.traits,
+                        "implementors": p.hierarchy.implementors,
+                        "supertraits": p.hierarchy.supertraits,
+                    },
                 });
                 ToolOutput { text, structured }
             }
@@ -663,6 +789,65 @@ fn tools() -> Value {
             })
         ),
         tool(
+            "get_hierarchy",
+            "Type/trait hierarchy: traits a type implements, types implementing a trait, and a trait's supertraits.",
+            json!({ "name": { "type": "string", "description": "Exact type or trait name" } }),
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "traits": { "type": "array", "items": { "type": "string" } },
+                    "implementors": { "type": "array", "items": { "type": "string" } },
+                    "supertraits": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["name", "kinds"]
+            })
+        ),
+        tool(
+            "trace_path",
+            "Call chain connecting two symbols, through resolved edges only. Shortest known chain, not a proof of uniqueness.",
+            json!({
+                "from": { "type": "string", "description": "Starting symbol name" },
+                "to": { "type": "string", "description": "Target symbol name" }
+            }),
+            json!(["from", "to"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string" },
+                    "to": { "type": "string" },
+                    "path": { "type": ["array", "null"], "items": tree_schema() }
+                },
+                "required": ["from", "to"]
+            })
+        ),
+        tool(
+            "profile",
+            "Everything about one symbol in a single call: definitions, caller tiers, resolved callees, lexical references, hierarchy.",
+            json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "definitions": array_of(symbol_schema()),
+                    "callers": { "type": "object" },
+                    "callees": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "file": { "type": "string" },
+                            "line": { "type": "integer" }
+                        }
+                    })),
+                    "references": { "type": "object" },
+                    "hierarchy": { "type": "object" }
+                },
+                "required": ["name", "definitions", "callers", "references", "hierarchy"]
+            })
+        ),
+        tool(
             "blast_radius",
             "Everything that transitively calls this symbol through resolved edges — what a change here can reach.",
             json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
@@ -846,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_exactly_the_nine_tools() {
+    fn tools_list_exposes_exactly_the_twelve_tools() {
         let (_d, server) = fixture();
         let resp = call(&server, 2, "tools/list", json!({}));
         let tools = resp["result"]["tools"].as_array().unwrap();
