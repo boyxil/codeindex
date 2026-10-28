@@ -188,25 +188,53 @@ pub fn references(
     name: &str,
     limit: usize,
 ) -> Result<Vec<Reference>> {
-    let defs: HashSet<Key> = store
+    let defs_list: Vec<Key> = store
         .definitions(name)?
         .into_iter()
         .map(|d| (d.file, d.line))
         .collect();
+    let defs: HashSet<Key> = defs_list.iter().cloned().collect();
     let calls: HashMap<Key, Option<(String, i64)>> = store
         .callers(name)?
         .into_iter()
         .map(|c| ((c.file, c.line), c.target))
         .collect();
+    let parts: Vec<&str> = name.split("::").collect();
+    let matches_at = |tokens: &[crate::lexer::Token], src: &str, i: usize| -> bool {
+        // A qualified name (`Enum::Variant`) is not one token: match the
+        // whole `ident (:: ident)*` sequence.
+        let mut j = i;
+        for (k, part) in parts.iter().enumerate() {
+            if k > 0 {
+                let is_colon = |t: &crate::lexer::Token| {
+                    t.kind == crate::lexer::Tok::Punct && crate::lexer::text(src, t) == ":"
+                };
+                if !tokens.get(j).is_some_and(is_colon) || !tokens.get(j + 1).is_some_and(is_colon)
+                {
+                    return false;
+                }
+                j += 2;
+            }
+            match tokens.get(j) {
+                Some(t)
+                    if t.kind == crate::lexer::Tok::Ident
+                        && crate::lexer::text(src, t) == *part => {}
+                _ => return false,
+            }
+            j += 1;
+        }
+        true
+    };
     let mut seen: HashSet<Key> = HashSet::new();
     let mut out = Vec::new();
     for path in store.file_paths()? {
         let Ok(src) = std::fs::read_to_string(root.join(&path)) else {
             continue;
         };
-        for tok in crate::lexer::lex(&src) {
+        let tokens = crate::lexer::lex(&src);
+        for (i, tok) in tokens.iter().enumerate() {
             if tok.kind != crate::lexer::Tok::Ident
-                || crate::lexer::text(&src, &tok) != name
+                || !matches_at(&tokens, &src, i)
                 || !seen.insert((path.clone(), tok.line as i64))
             {
                 continue;
@@ -224,6 +252,19 @@ pub fn references(
                 line: tok.line as i64,
                 kind,
                 target,
+            });
+        }
+    }
+    // A qualified definition is written short at its own site
+    // (`Ident,` inside `enum Tok`), so the token scan above cannot see
+    // it — the index already knows where it is.
+    for key in &defs_list {
+        if seen.insert(key.clone()) {
+            out.push(Reference {
+                file: key.0.clone(),
+                line: key.1,
+                kind: "definition",
+                target: None,
             });
         }
     }
@@ -477,6 +518,24 @@ mod tests {
         assert!(symbol_source(&store, dir.path(), "nope", None, 50)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn references_understand_qualified_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "enum Tok {\n    Ident,\n}\nfn f(t: Tok) -> bool {\n    matches!(t, Tok::Ident)\n}\n",
+        )
+        .unwrap();
+        crate::index(dir.path()).unwrap();
+        let store = Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        let refs = references(&store, dir.path(), "Tok::Ident", 10).unwrap();
+        let kinds: Vec<(&str, i64)> = refs.iter().map(|r| (r.kind, r.line)).collect();
+        assert_eq!(kinds, vec![("definition", 2), ("mention", 5)]);
+        // A plain name still matches its plain occurrences.
+        let refs = references(&store, dir.path(), "Tok", 10).unwrap();
+        assert!(refs.iter().any(|r| r.line == 1));
     }
 
     #[test]

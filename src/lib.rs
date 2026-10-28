@@ -587,6 +587,46 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Variant names of an enum body. A variant starts after `{`, `,` or an
+/// attribute's `]` at brace depth 1; tuple/struct payloads are skipped by
+/// tracking their brackets. Discriminants (`A = 1`) do not confuse it.
+fn enum_variants<'a>(
+    tokens: &'a [lexer::Token],
+    src: &str,
+    open: usize,
+    close: usize,
+) -> Vec<&'a lexer::Token> {
+    let mut out = Vec::new();
+    let mut brace_depth = 0i32;
+    let mut paren_depth = 0i32;
+    let mut expect_name = false;
+    let mut j = open;
+    while j < close {
+        let t = &tokens[j];
+        if t.kind == Tok::Punct {
+            match text(src, t) {
+                "{" => {
+                    brace_depth += 1;
+                    if brace_depth == 1 {
+                        expect_name = true;
+                    }
+                }
+                "}" => brace_depth -= 1,
+                "(" => paren_depth += 1,
+                ")" => paren_depth = (paren_depth - 1).max(0),
+                "," if brace_depth == 1 && paren_depth == 0 => expect_name = true,
+                "]" if brace_depth == 1 && paren_depth == 0 => expect_name = true,
+                _ => {}
+            }
+        } else if t.kind == Tok::Ident && brace_depth == 1 && paren_depth == 0 && expect_name {
+            out.push(t);
+            expect_name = false;
+        }
+        j += 1;
+    }
+    out
+}
+
 /// Contiguous `///` / `//!` lines directly above `line` (1-based),
 /// regardless of `#[…]` attributes in between; a blank line or any other
 /// text stops the block. Docs are the strongest semantic signal a
@@ -657,23 +697,42 @@ fn extract_items(tokens: &[lexer::Token], src: &str, file: &Path, out: &mut Vec<
                     i += 1; // e.g. `fn(` in a fn-pointer type — not an item
                     continue;
                 }
-                // A fn's body span lets the call-graph queries climb
-                // from a call site to its enclosing function.
-                let end_line = if *kw == "fn" {
-                    body_span(tokens, src, i + 2)
-                        .map(|(_, close)| tokens[close].line)
-                        .unwrap_or(tok.line)
-                } else {
-                    tok.line
-                };
+                // The body span serves two masters: call-graph queries
+                // climb from a call site to its enclosing fn, and
+                // `get_symbol` slices a whole item. Declarations without
+                // a body (`struct S;`, `mod m;`, trait method signatures)
+                // stay single-line.
+                let body = body_span(tokens, src, i + 2);
+                let end_line = body
+                    .map(|(_, close)| tokens[close].line)
+                    .unwrap_or(tok.line);
+                let name = text(src, next).to_string();
                 out.push(Symbol {
-                    name: text(src, next).to_string(),
+                    name: name.clone(),
                     kind: kw,
                     file: file.to_path_buf(),
                     line: tok.line,
                     end_line,
                     signature: signature(tok.line),
                 });
+                if *kw == "enum" {
+                    if let Some((open, close)) = body {
+                        for variant in enum_variants(tokens, src, open, close) {
+                            out.push(Symbol {
+                                // Qualified on purpose: a variant is not a
+                                // module-scope name (bare use needs an
+                                // import), and the resolver looks it up as
+                                // `Enum::Variant`.
+                                name: format!("{name}::{}", text(src, variant)),
+                                kind: "variant",
+                                file: file.to_path_buf(),
+                                line: variant.line,
+                                end_line: variant.line,
+                                signature: signature(variant.line),
+                            });
+                        }
+                    }
+                }
             }
             ItemKind::Impl => {
                 // The implemented type is the last ident before the brace
@@ -719,12 +778,17 @@ mod tests {
         .unwrap();
         let inv = scan(dir.path()).unwrap();
         assert_eq!(inv.files, 1);
-        assert_eq!(inv.total(), 5);
+        // The enum contributes its variant as a symbol too.
+        assert_eq!(inv.total(), 6);
         assert_eq!(inv.fn_count(), 1);
         assert_eq!(inv.struct_count(), 1);
         assert_eq!(inv.enum_count(), 1);
         assert_eq!(inv.trait_count(), 1);
         assert_eq!(inv.impl_count(), 1);
+        assert!(inv
+            .symbols
+            .iter()
+            .any(|s| s.kind == "variant" && s.name == "Gamma::A"));
         assert_eq!(inv.symbols[0].name, "alpha");
         assert_eq!(inv.symbols[0].line, 1);
         // `impl Trait for Type` names the TYPE.

@@ -14,6 +14,14 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+/// A tool's answer: human-readable text plus the same facts as data.
+/// Older clients read `content`; newer ones (MCP 2025-03-26+) read
+/// `structuredContent` against `outputSchema`.
+pub struct ToolOutput {
+    pub text: String,
+    pub structured: Value,
+}
+
 /// Used when the client does not name a protocol version.
 pub const PROTOCOL_FALLBACK: &str = "2024-11-05";
 
@@ -104,19 +112,21 @@ impl McpServer {
         }
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
         Ok(match self.run_tool(&name, &args) {
-            Ok(text) => json!({
-                "content": [{ "type": "text", "text": text }],
+            Ok(out) => json!({
+                "content": [{ "type": "text", "text": out.text }],
+                "structuredContent": out.structured,
                 "isError": false
             }),
             // Tool failures are results with isError, not protocol errors.
             Err(e) => json!({
                 "content": [{ "type": "text", "text": format!("error: {e:#}") }],
+                "structuredContent": { "error": format!("{e:#}") },
                 "isError": true
             }),
         })
     }
 
-    fn run_tool(&self, name: &str, args: &Value) -> Result<String> {
+    fn run_tool(&self, name: &str, args: &Value) -> Result<ToolOutput> {
         if self.refresh {
             let stats = crate::index(&self.root)?;
             if stats.parsed > 0 {
@@ -158,7 +168,7 @@ impl McpServer {
                         );
                     };
                     let hits = yantrik::hybrid_search(&store, client, &query, limit)?;
-                    let mut out = format!(
+                    let mut text = format!(
                         "{} semantic hit(s) for \"{query}\" (namespace {}):\n",
                         hits.len(),
                         client.config().namespace
@@ -174,33 +184,54 @@ impl McpServer {
                         } else {
                             h.signature.clone()
                         };
-                        out.push_str(&format!(
+                        text.push_str(&format!(
                             "  {} {:>7} {} {}:{}  {}\n",
                             score, h.kind, h.name, h.file, h.line, signature
                         ));
                     }
-                    return Ok(out);
+                    let structured = json!({
+                        "query": query,
+                        "mode": "semantic",
+                        "hits": hits.iter().map(|h| json!({
+                            "source": h.source,
+                            "score": h.score,
+                            "kind": h.kind,
+                            "name": h.name,
+                            "file": h.file,
+                            "line": h.line,
+                            "signature": h.signature,
+                        })).collect::<Vec<_>>(),
+                    });
+                    return Ok(ToolOutput { text, structured });
                 }
                 let kind = sarg("kind");
                 let path = sarg("path");
                 let hits = store.search_symbols(&query, kind.as_deref(), path.as_deref())?;
                 let shown = hits.len().min(limit);
-                let mut out = format!("{} match(es) for \"{query}\":\n", hits.len());
+                let mut text = format!("{} match(es) for \"{query}\":\n", hits.len());
                 for s in hits.iter().take(limit) {
-                    out.push_str(&format!(
+                    text.push_str(&format!(
                         "  {:>7} {} {}:{}\n",
                         s.kind, s.name, s.file, s.line
                     ));
                 }
                 if shown < hits.len() {
-                    out.push_str(&format!("  … {} more\n", hits.len() - shown));
+                    text.push_str(&format!("  … {} more\n", hits.len() - shown));
                 }
-                out
+                let structured = json!({
+                    "query": query,
+                    "mode": "lexical",
+                    "matches": hits.iter().take(limit).map(|s| json!({
+                        "kind": s.kind, "name": s.name, "file": s.file, "line": s.line,
+                    })).collect::<Vec<_>>(),
+                    "truncated": shown < hits.len(),
+                });
+                ToolOutput { text, structured }
             }
             "get_definition" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let defs = store.definitions(&name)?;
-                if defs.is_empty() {
+                let text = if defs.is_empty() {
                     format!("no symbol named \"{name}\"\n")
                 } else {
                     let mut out = format!("{} definition(s) of \"{name}\":\n", defs.len());
@@ -211,80 +242,131 @@ impl McpServer {
                         ));
                     }
                     out
-                }
+                };
+                let structured = json!({
+                    "name": name,
+                    "definitions": defs.iter().map(|d| json!({
+                        "kind": d.kind, "name": d.name, "file": d.file, "line": d.line,
+                    })).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
             }
             "get_callers" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let refs = store.callers(&name)?;
-                let mut out = format!("{} call site(s) of \"{name}\":\n", refs.len());
+                let mut text = format!("{} call site(s) of \"{name}\":\n", refs.len());
                 for r in &refs {
                     match (&r.target, &r.reason) {
-                        (Some((f, l)), _) => out.push_str(&format!(
+                        (Some((f, l)), _) => text.push_str(&format!(
                             "  {}:{} ({} → {}:{})\n",
                             r.file, r.line, r.tier, f, l
                         )),
-                        (None, Some(reason)) => out.push_str(&format!(
+                        (None, Some(reason)) => text.push_str(&format!(
                             "  {}:{} ({}, {})\n",
                             r.file, r.line, r.tier, reason
                         )),
-                        _ => out.push_str(&format!("  {}:{} ({})\n", r.file, r.line, r.tier)),
+                        _ => text.push_str(&format!("  {}:{} ({})\n", r.file, r.line, r.tier)),
                     }
                 }
-                out
+                let structured = json!({
+                    "name": name,
+                    "callers": refs.iter().map(|r| json!({
+                        "file": r.file,
+                        "line": r.line,
+                        "tier": r.tier,
+                        "target": r.target.as_ref().map(|(f, l)| json!({"file": f, "line": l})),
+                        "reason": r.reason,
+                    })).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
             }
             "get_references" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let limit = narg("limit", 100);
                 let refs = query::references(&store, &self.root, &name, limit)?;
-                let mut out = format!(
+                let mut text = format!(
                     "{} reference(s) to \"{name}\" (lexical occurrences in indexed files):\n",
                     refs.len()
                 );
                 for r in &refs {
                     match &r.target {
-                        Some((f, l)) => out.push_str(&format!(
+                        Some((f, l)) => text.push_str(&format!(
                             "  {}:{}  {} → {}:{}\n",
                             r.file, r.line, r.kind, f, l
                         )),
-                        None => out.push_str(&format!("  {}:{}  {}\n", r.file, r.line, r.kind)),
+                        None => text.push_str(&format!("  {}:{}  {}\n", r.file, r.line, r.kind)),
                     }
                 }
-                out
+                let structured = json!({
+                    "name": name,
+                    "references": refs.iter().map(|r| json!({
+                        "file": r.file,
+                        "line": r.line,
+                        "kind": r.kind,
+                        "target": r.target.as_ref().map(|(f, l)| json!({"file": f, "line": l})),
+                    })).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
             }
             "call_tree" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let depth = narg("depth", 3);
                 let tree = query::call_tree(&store, &name, depth)?;
-                if tree.is_empty() {
+                let text = if tree.is_empty() {
                     format!("no symbol named \"{name}\"\n")
                 } else {
                     let mut out = format!("callers of \"{name}\" (resolved edges only):\n");
                     render_tree(&mut out, &tree, 1);
                     out
-                }
+                };
+                let structured = json!({
+                    "name": name,
+                    "roots": tree.iter().map(node_value).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
             }
             "blast_radius" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let affected = query::blast_radius(&store, &name)?;
-                let mut out = format!(
+                let mut text = format!(
                     "{} transitive call site(s) of \"{name}\":\n",
                     affected.len()
                 );
                 for a in &affected {
-                    out.push_str(&format!("  d{} {}:{}\n", a.depth, a.file, a.line));
+                    text.push_str(&format!("  d{} {}:{}\n", a.depth, a.file, a.line));
                 }
-                out
+                let structured = json!({
+                    "name": name,
+                    "affected": affected.iter().map(|a| json!({
+                        "file": a.file, "line": a.line, "depth": a.depth,
+                    })).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
             }
             "get_symbol" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let file = sarg("file");
                 let max_lines = narg("max_lines", 120);
                 match query::symbol_source(&store, &self.root, &name, file.as_deref(), max_lines)? {
-                    Some(src) => format!(
-                        "{} {} at {}:{}-{}:\n{}",
-                        src.kind, src.name, src.file, src.start, src.end, src.text
-                    ),
-                    None => format!("no symbol named \"{name}\"\n"),
+                    Some(src) => {
+                        let text = format!(
+                            "{} {} at {}:{}-{}:\n{}",
+                            src.kind, src.name, src.file, src.start, src.end, src.text
+                        );
+                        let structured = json!({
+                            "kind": src.kind,
+                            "name": src.name,
+                            "file": src.file,
+                            "start": src.start,
+                            "end": src.end,
+                            "text": src.text,
+                        });
+                        ToolOutput { text, structured }
+                    }
+                    None => ToolOutput {
+                        text: format!("no symbol named \"{name}\"\n"),
+                        structured: json!({ "name": name, "found": false }),
+                    },
                 }
             }
             "stats" => {
@@ -314,11 +396,22 @@ impl McpServer {
                 }
                 let mut text = serde_json::to_string_pretty(&value)?;
                 text.push('\n');
-                text
+                ToolOutput {
+                    text,
+                    structured: value,
+                }
             }
             other => unreachable!("TOOL_NAMES checked before dispatch: {other}"),
         })
     }
+}
+
+fn node_value(node: &CallNode) -> Value {
+    json!({
+        "file": node.file,
+        "line": node.line,
+        "children": node.children.iter().map(node_value).collect::<Vec<_>>(),
+    })
 }
 
 fn dict(counts: &[(String, usize)]) -> Value {
@@ -353,7 +446,12 @@ fn tool(name: &str, description: &str, properties: Value, required: Value) -> Va
             "type": "object",
             "properties": properties,
             "required": required
-        }
+        },
+        // The structured answer is an object whose exact shape is
+        // documented per tool; this schema only asserts that much so
+        // clients can rely on object access without us over-specifying
+        // every field before a client needs it.
+        "outputSchema": { "type": "object" }
     })
 }
 
@@ -536,6 +634,7 @@ mod tests {
         assert_eq!(names, TOOL_NAMES);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
+            assert_eq!(t["outputSchema"]["type"], "object");
         }
     }
 
@@ -546,6 +645,22 @@ mod tests {
         assert!(text.contains("helper"), "{text}");
         let text = tool_text(&server, "get_definition", json!({ "name": "helper" }));
         assert!(text.contains("lib.rs:1"), "{text}");
+    }
+
+    #[test]
+    fn tool_results_carry_structured_content() {
+        let (_d, server) = fixture();
+        let resp = call(
+            &server,
+            9,
+            "tools/call",
+            json!({ "name": "get_definition", "arguments": { "name": "helper" } }),
+        );
+        let structured = &resp["result"]["structuredContent"];
+        assert_eq!(structured["name"], "helper");
+        assert_eq!(structured["definitions"][0]["file"], "lib.rs");
+        assert_eq!(structured["definitions"][0]["line"], 1);
+        assert_eq!(resp["result"]["isError"], false);
     }
 
     #[test]

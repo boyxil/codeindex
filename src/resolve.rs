@@ -108,6 +108,9 @@ pub struct Item {
     pub line: i64,
     /// Inside an `impl` or `trait` body: not a module-scope callable.
     pub in_body: bool,
+    /// The module the item lives in — needed to find qualified children
+    /// (`Enum::Variant`, `Trait::method`) declared beside it.
+    pub module: String,
 }
 
 #[derive(Debug, Clone)]
@@ -191,13 +194,34 @@ impl Resolver {
             };
             for s in &f.symbols {
                 let module = deepen(&f.module, &f.module_spans, s.line);
-                program.items.entry(module).or_default().push(Item {
+                program.items.entry(module.clone()).or_default().push(Item {
                     name: s.name.clone(),
                     kind: s.kind.clone(),
                     file_id: f.file_id,
                     line: s.line,
                     in_body: in_body(s.line),
+                    module,
                 });
+            }
+            // Trait methods are not module-scope names, but `Trait::method`
+            // and `use Trait::method` do reach them: register them as
+            // qualified items in the trait's own module.
+            for tr in &f.trait_spans {
+                let module = deepen(&f.module, &f.module_spans, tr.start_line as i64);
+                for s in f.symbols.iter().filter(|s| {
+                    s.kind == "fn"
+                        && (tr.start_line as i64) < s.line
+                        && s.line <= tr.end_line as i64
+                }) {
+                    program.items.entry(module.clone()).or_default().push(Item {
+                        name: format!("{}::{}", tr.name, s.name),
+                        kind: "fn".to_string(),
+                        file_id: f.file_id,
+                        line: s.line,
+                        in_body: true,
+                        module: module.clone(),
+                    });
+                }
             }
             for imp in &f.impl_spans {
                 let fns = f
@@ -301,7 +325,9 @@ impl Resolver {
             }
             match self.resolve_path(&imp.path, module) {
                 Some(Binding::Item(it)) => {
-                    if it.kind == "fn" {
+                    // An imported variant is a constructor call, which is
+                    // as real a target as a fn.
+                    if it.kind == "fn" || it.kind == "variant" {
                         found.push(it);
                     } else {
                         return unresolved(R_NOT_FN);
@@ -363,8 +389,32 @@ impl Resolver {
                     None => unresolved(R_NOT_IN_MODULE),
                 }
             }
-            Some(Binding::Item(it)) => self.resolve_in_impl(&it.name, name),
+            Some(Binding::Item(it)) => {
+                let by_impl = self.resolve_in_impl(&it.name, name);
+                if by_impl.tier != TIER_UNRESOLVED {
+                    return by_impl;
+                }
+                // No impl fn: an enum's variant or a trait's method is a
+                // qualified item beside its owner.
+                match self.qualified_item(&it, name) {
+                    Some(q) => resolved((q.file_id, q.line)),
+                    None => by_impl,
+                }
+            }
         }
+    }
+
+    /// A child registered under its owner (`Enum::Variant`,
+    /// `Trait::method`) in the owner's module.
+    fn qualified_item(&self, owner: &Item, member: &str) -> Option<Item> {
+        let qualified = format!("{}::{member}", owner.name);
+        self.program
+            .items
+            .get(&owner.module)
+            .into_iter()
+            .flatten()
+            .find(|i| i.name == qualified)
+            .cloned()
     }
 
     fn resolve_in_impl(&self, type_name: &str, name: &str) -> Resolution {
@@ -415,81 +465,126 @@ impl Resolver {
     }
 
     /// Resolve a `use`-style path (`crate::a::b`, `self::x`, `super::y`,
-    /// `bare::path`) from `from_module` to a module or an item.
+    /// `bare::path`) from `from_module` to a module or an item. Re-export
+    /// chains are followed through `use` bindings, bounded by depth.
     fn resolve_path(&self, path: &str, from_module: &str) -> Option<Binding> {
+        self.resolve_path_inner(path, from_module, 0)
+    }
+
+    fn resolve_path_inner(&self, path: &str, from_module: &str, depth: usize) -> Option<Binding> {
+        if depth > 8 {
+            return None; // a re-export cycle
+        }
         let mut segs: Vec<&str> = path.split("::").collect();
         if segs.first() == Some(&"") {
             return None; // `::abs` — 2015 absolute path, external
         }
-        let mut cur: Option<String> = None;
-        while let Some(first) = segs.first().copied() {
-            match first {
-                "crate" => {
-                    cur = Some(ns_root(from_module).to_string());
+        let mut base = from_module.to_string();
+        let mut absolute = false;
+        loop {
+            match segs.first().copied() {
+                Some("crate") => {
+                    base = ns_root(from_module).to_string();
                     segs.remove(0);
+                    absolute = true;
                     break;
                 }
-                "self" => {
-                    cur = Some(from_module.to_string());
+                Some("self") => {
                     segs.remove(0);
+                    absolute = true;
                     break;
                 }
-                "super" => {
-                    let base = cur.as_deref().unwrap_or(from_module);
-                    cur = Some(parent(base)?);
+                Some("super") => {
+                    base = parent(&base)?;
                     segs.remove(0);
+                    absolute = true;
                 }
                 _ => break,
             }
         }
-        let mut cur = match cur {
-            Some(c) => c,
-            None => {
-                // Bare path: local top-level module or item, else the
-                // crate alias, else an external crate we do not index.
-                let first = *segs.first()?;
-                let local = format!("{}::{}", ns_root(from_module), first);
-                if self.program.modules.contains(&local) {
+        if !absolute {
+            // Bare path: something at the namespace root (or a crate
+            // alias for `pkg::item` in bin code), else external.
+            let first = *segs.first()?;
+            match self.resolve_module_or_item(ns_root(from_module), first, depth) {
+                Some(binding) => {
                     segs.remove(0);
-                    local
-                } else if self.program.items.contains_key(ns_root(from_module))
-                    && self
-                        .program
-                        .items
-                        .get(ns_root(from_module))
-                        .is_some_and(|v| v.iter().any(|i| i.name == first))
-                {
-                    ns_root(from_module).to_string()
-                } else {
-                    let root = self.program.crate_aliases.get(first)?;
+                    return self.walk_binding(binding, segs, depth);
+                }
+                None => {
+                    base = self.program.crate_aliases.get(first)?.clone();
                     segs.remove(0);
-                    root.clone()
                 }
             }
-        };
-        while !segs.is_empty() {
-            let seg = segs.remove(0);
-            let next = format!("{cur}::{seg}");
-            if segs.is_empty() {
-                if self.program.modules.contains(&next) {
-                    return Some(Binding::Module(next));
+        }
+        self.walk_module(base, segs, depth)
+    }
+
+    /// Continue from an already resolved first binding.
+    fn walk_binding(&self, binding: Binding, segs: Vec<&str>, depth: usize) -> Option<Binding> {
+        match binding {
+            Binding::Module(m) => self.walk_module(m, segs, depth),
+            Binding::Item(it) => {
+                let mut segs = segs;
+                if segs.is_empty() {
+                    return Some(Binding::Item(it));
                 }
-                return self
-                    .program
-                    .items
-                    .get(&cur)
-                    .into_iter()
-                    .flatten()
-                    .find(|i| i.name == seg)
-                    .cloned()
-                    .map(Binding::Item);
+                // Remaining segments name a qualified child.
+                let child = segs.remove(0);
+                let q = self.qualified_item(&it, child)?;
+                self.walk_binding(Binding::Item(q), segs, depth)
             }
-            if !self.program.modules.contains(&next) {
-                return None;
+        }
+    }
+
+    fn walk_module(&self, base: String, mut segs: Vec<&str>, depth: usize) -> Option<Binding> {
+        let mut cur = base;
+        while let Some(seg) = segs.first().copied() {
+            let binding = self.resolve_module_or_item(&cur, seg, depth)?;
+            segs.remove(0);
+            match binding {
+                Binding::Module(m) => cur = m,
+                Binding::Item(it) => return self.walk_binding(Binding::Item(it), segs, depth),
             }
-            cur = next;
         }
         Some(Binding::Module(cur))
+    }
+
+    /// One step of a path: a module, an item declared in `module`, or a
+    /// binding re-exported into it.
+    fn resolve_module_or_item(&self, module: &str, seg: &str, depth: usize) -> Option<Binding> {
+        let m = format!("{module}::{seg}");
+        if self.program.modules.contains(&m) {
+            return Some(Binding::Module(m));
+        }
+        if let Some(it) = self
+            .program
+            .items
+            .get(module)
+            .into_iter()
+            .flatten()
+            .find(|i| i.name == seg && !i.in_body)
+        {
+            return Some(Binding::Item(it.clone()));
+        }
+        self.resolve_import(module, seg, depth)
+    }
+
+    /// Follow a `use` binding: the re-export chain ends when the target
+    /// resolves, or the depth cap stops a cycle.
+    fn resolve_import(&self, module: &str, name: &str, depth: usize) -> Option<Binding> {
+        if depth > 8 {
+            return None;
+        }
+        for imp in self.program.imports.get(module).into_iter().flatten() {
+            if imp.glob || imp.alias != name {
+                continue;
+            }
+            if let Some(b) = self.resolve_path_inner(&imp.path, module, depth + 1) {
+                return Some(b);
+            }
+        }
+        None
     }
 }
 
@@ -577,6 +672,59 @@ mod tests {
         let via_type = at(&e, "store.rs", 9);
         assert_eq!(via_type.tier, TIER_RESOLVED);
         assert_eq!(via_type.target, Some(("store.rs".into(), 3)));
+    }
+
+    #[test]
+    fn enum_variants_resolve_through_their_enum() {
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "enum Color {\n    Red,\n    Green(u8),\n    Blue { shade: u8 },\n}\nfn paint() {\n    Color::Green(1);\n}\n",
+        )]);
+        let edge = at(&e, "lib.rs", 7);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("lib.rs".into(), 3)));
+    }
+
+    #[test]
+    fn imported_variant_constructors_resolve() {
+        let (_d, e) = run(&[
+            ("lib.rs", "mod a;\nmod b;\n"),
+            ("a.rs", "pub enum Color { Red, Green }\n"),
+            (
+                "b.rs",
+                "use crate::a::Color::Green;\nfn paint() {\n    Green();\n}\n",
+            ),
+        ]);
+        let edge = at(&e, "b.rs", 3);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("a.rs".into(), 1)));
+    }
+
+    #[test]
+    fn re_export_chains_resolve() {
+        let (_d, e) = run(&[
+            ("lib.rs", "mod a;\nmod facade;\nmod b;\n"),
+            ("a.rs", "pub enum Color { Red, Green }\n"),
+            ("facade.rs", "pub use crate::a::Color;\n"),
+            (
+                "b.rs",
+                "use crate::facade::Color;\nfn paint() {\n    Color::Green();\n    let _ = Color::Red;\n}\n",
+            ),
+        ]);
+        let edge = at(&e, "b.rs", 3);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("a.rs".into(), 1)));
+    }
+
+    #[test]
+    fn trait_methods_resolve_through_the_trait() {
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "trait Shape {\n    fn area(&self) -> u8;\n}\nfn measure(s: &dyn Shape) {\n    Shape::area(s);\n}\n",
+        )]);
+        let edge = at(&e, "lib.rs", 5);
+        assert_eq!(edge.tier, TIER_RESOLVED);
+        assert_eq!(edge.target, Some(("lib.rs".into(), 2)));
     }
 
     #[test]

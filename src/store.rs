@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: &str = "3";
 /// scopes since M3). Unlike schema_version this describes the *derived*
 /// data: bumping it makes stored hashes stale as parse decisions, so the
 /// next index run re-parses everything once.
-pub const EXTRACTOR_VERSION: &str = "6";
+pub const EXTRACTOR_VERSION: &str = "7";
 
 /// One indexed symbol joined with its file — the read API M2 queries
 /// grow from.
