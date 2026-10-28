@@ -71,8 +71,15 @@ health/историю/семантику, но не отвечает на стр
   Схема v2; резолюция пересчитывается целиком при каждом `index`.
   42/42 теста + мутационные проверки (сломанный резолвер роняет
   тесты); само-индекс 1541 ребро, 186 resolved.
-- **M4:** MCP-сервер (stdio) с семью инструментами; документация
-  подключения в zcode/opencode.
+- **M4 (готово):** MCP-сервер stdio (JSON-RPC 2.0 по строкам):
+  initialize/ping/tools list/tools call; 7 инструментов —
+  search_symbols, get_definition, get_callers, get_references,
+  call_tree, blast_radius, stats. stdout — только протокол, логи в
+  stderr; инкрементальный ре-индекс перед каждым tool call
+  (`--no-refresh` отключает). get_references — лексические вхождения
+  по индексированным файлам (definition/call/mention; не-вызовы не
+  выдаются за резолв). Живая stdio-сессия — integration test
+  tests/mcp_stdio.rs. Подключение к zcode/opencode — AGENTS.md.
 - **M5 (опционально):** бэкенд YantrikDB + эмбеддинги сигнатур для
   семантического поиска символов.
 

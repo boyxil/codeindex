@@ -14,6 +14,42 @@ cargo run -- scan <путь>        # M0: инвентарь символов
 # M1+: cargo run -- index <путь> && cargo run -- search <query>
 ```
 
+## MCP-сервер (M4): подключение
+
+`codeindex serve <репо>` — JSON-RPC 2.0 по stdio (по строке на сообщение).
+stdout — только протокол, логи в stderr. На старте сервер делает
+инкрементальный `index`; по умолчанию повторяет его перед каждым tool
+call (свежесть важнее скорости; `--no-refresh` отключает).
+
+Инструменты: `search_symbols`, `get_definition`, `get_callers`,
+`get_references`, `call_tree`, `blast_radius`, `stats`. `get_references`
+— лексические вхождения по индексированным файлам (definition/call/
+mention); не-вызовы честно помечены `mention`, не «resolved».
+
+Собрать бинарник: `cargo build --release` → `target/release/codeindex`
+(с учётом `CARGO_TARGET_DIR`, если задан).
+
+zcode — `~/.zcode/cli/config.json`, ключ `servers` (формат проверен
+по живому конфигу):
+
+```json
+{ "servers": { "codeindex": {
+    "command": "/path/to/codeindex",
+    "args": ["serve", "/media/veracrypt3/Developer/codeindex"]
+} } }
+```
+
+opencode — `~/.config/opencode/cli.json` (или `opencode.json`), ключ
+`mcp`:
+
+```json
+{ "mcp": { "codeindex": {
+    "type": "local",
+    "command": ["/path/to/codeindex", "serve", "/path/to/repo"],
+    "enabled": true
+} } }
+```
+
 ## Состояние (обновлять после каждой вехи!)
 
 - **M0 готов** (2026-10-28): сканер символов (свой лексер + токенный
@@ -62,7 +98,21 @@ cargo run -- scan <путь>        # M0: инвентарь символов
   само-индекс: 178 символов / 1541 ребро (186 resolved, 1093
   candidate, 262 unresolved), `call_tree lex` доходит до main.rs:82;
   повторная индексация 0 parsed.
-- Следующая веха: **M4** — MCP-сервер stdio с 7 инструментами.
+- **M4 готов** (2026-10-28): MCP-сервер stdio (JSON-RPC 2.0 по
+  строкам): `initialize`/`ping`/`tools/list`/`tools/call`, 7
+  инструментов; уведомления без ответа, неизвестный метод — -32601,
+  неизвестный тул — -32602, сбой тула — result с `isError` (не
+  протокольная ошибка). `stats` — счётчики по kind и «реестр
+  честности» (reasons). `get_references` читает индексированные файлы
+  на запросе: индекс даёт набор файлов, лексер — вхождения
+  (definition/call/mention). Живая stdio-сессия — интеграционный тест
+  `tests/mcp_stdio.rs` (спавнит бинарник, говорит JSON-RPC). 52/52 +
+  1 интеграционный, clippy чисто; живой прогон на своём репо: 9
+  файлов / 213 символов / 1875 рёбер (230 resolved, 1311 candidate,
+  334 unresolved). Попутный фикс: `blast_radius` терял второе место
+  вызова из той же функции.
+- Следующая веха: **M5 (опционально)** — бэкенд YantrikDB +
+  эмбеддинги сигнатур для семантического поиска символов.
 
 ## Важно
 

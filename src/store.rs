@@ -537,6 +537,47 @@ impl Store {
         Ok(n as usize)
     }
 
+    pub fn file_count(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Indexed file paths (relative to the root), ordered.
+    pub fn file_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Symbol counts per kind, highest first — for `stats`.
+    pub fn symbol_kind_counts(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, COUNT(*) FROM symbols GROUP BY kind ORDER BY 2 DESC, 1")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Non-resolved edge reasons, highest first — the honesty ledger.
+    pub fn edge_reason_counts(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reason, COUNT(*) FROM edges
+             WHERE reason IS NOT NULL
+             GROUP BY reason ORDER BY 2 DESC, 1",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Every indexed symbol joined with its file path, ordered for
     /// stable output.
     pub fn symbols(&self) -> Result<Vec<IndexedSymbol>> {

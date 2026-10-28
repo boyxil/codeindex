@@ -13,6 +13,7 @@
 //! M3 adds the in-house name resolver (use-tree + module tree).
 
 pub mod lexer;
+pub mod mcp;
 pub mod query;
 pub mod resolve;
 pub mod scopes;

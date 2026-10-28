@@ -4,6 +4,7 @@
 //! M1: incremental SQLite index at <path>/.codeindex/index.db.
 //! M2: queries over the store — search, definition, callers.
 //! M3: in-house name resolver — resolved edges, call_tree, blast_radius.
+//! M4: MCP server over stdio (`serve`) with seven tools.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -68,6 +69,25 @@ enum Command {
         path: PathBuf,
         /// Exact symbol name.
         name: String,
+    },
+    /// Every lexical occurrence of a name in the indexed files, with
+    /// definition/call/mention classification.
+    References {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact identifier.
+        name: String,
+        /// Maximum results.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Serve the index over MCP (stdio, JSON-RPC 2.0).
+    Serve {
+        /// Repository root, indexed at startup.
+        path: PathBuf,
+        /// Skip the incremental re-index before each tool call.
+        #[arg(long)]
+        no_refresh: bool,
     },
 }
 
@@ -179,6 +199,25 @@ fn main() -> Result<()> {
             for a in &affected {
                 println!("  d{} {}:{}", a.depth, a.file, a.line);
             }
+        }
+        Command::References { path, name, limit } => {
+            let store = open(&path)?;
+            let refs = codeindex::query::references(&store, &path, &name, limit)?;
+            println!(
+                "{} reference(s) to \"{name}\" (lexical occurrences in indexed files):",
+                refs.len()
+            );
+            for r in &refs {
+                match &r.target {
+                    Some((f, l)) => {
+                        println!("  {}:{}  {} → {}:{}", r.file, r.line, r.kind, f, l)
+                    }
+                    None => println!("  {}:{}  {}", r.file, r.line, r.kind),
+                }
+            }
+        }
+        Command::Serve { path, no_refresh } => {
+            codeindex::mcp::run_stdio(path, !no_refresh)?;
         }
     }
     Ok(())

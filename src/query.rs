@@ -137,23 +137,90 @@ pub fn blast_radius(store: &Store, name: &str) -> Result<Vec<Affected>> {
     let mut out = Vec::new();
     while let Some((def, depth)) = queue.pop_front() {
         for site in incoming.get(&def).into_iter().flatten() {
-            let mut record = false;
+            // Every distinct call site matters: a function calling the
+            // symbol twice contributes two affected places, even though
+            // the function itself is expanded only once (`seen`).
+            out.push(Affected {
+                file: site.0.clone(),
+                line: site.1,
+                depth: depth + 1,
+            });
             if let Some(caller_def) = enclosing(&fns, site) {
-                record = seen.insert(caller_def.clone());
-                if record {
+                if seen.insert(caller_def.clone()) {
                     queue.push_back((caller_def, depth + 1));
                 }
-            }
-            if record {
-                out.push(Affected {
-                    file: site.0.clone(),
-                    line: site.1,
-                    depth: depth + 1,
-                });
             }
         }
     }
     out.sort_by(|a, b| (a.depth, &a.file, a.line).cmp(&(b.depth, &b.file, b.line)));
+    Ok(out)
+}
+
+/// One lexical occurrence of a name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reference {
+    pub file: String,
+    pub line: i64,
+    /// `definition` | `call` | `mention`
+    pub kind: &'static str,
+    /// Resolved target for calls that have one.
+    pub target: Option<(String, i64)>,
+}
+
+/// Every lexical identifier occurrence of `name` in the indexed files,
+/// classified against the symbols and edges we already know.
+///
+/// This reads the files at query time: the index supplies the file set,
+/// and the lexer is the only honest way to see type positions, `use`
+/// paths and patterns — those are not edges yet. Non-call occurrences
+/// are reported as `mention`, never as a resolved fact.
+pub fn references(
+    store: &Store,
+    root: &std::path::Path,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<Reference>> {
+    let defs: HashSet<Key> = store
+        .definitions(name)?
+        .into_iter()
+        .map(|d| (d.file, d.line))
+        .collect();
+    let calls: HashMap<Key, Option<(String, i64)>> = store
+        .callers(name)?
+        .into_iter()
+        .map(|c| ((c.file, c.line), c.target))
+        .collect();
+    let mut seen: HashSet<Key> = HashSet::new();
+    let mut out = Vec::new();
+    for path in store.file_paths()? {
+        let Ok(src) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        for tok in crate::lexer::lex(&src) {
+            if tok.kind != crate::lexer::Tok::Ident
+                || crate::lexer::text(&src, &tok) != name
+                || !seen.insert((path.clone(), tok.line as i64))
+            {
+                continue;
+            }
+            let key = (path.clone(), tok.line as i64);
+            let (kind, target) = if defs.contains(&key) {
+                ("definition", None)
+            } else if let Some(target) = calls.get(&key) {
+                ("call", target.clone())
+            } else {
+                ("mention", None)
+            };
+            out.push(Reference {
+                file: path.clone(),
+                line: tok.line as i64,
+                kind,
+                target,
+            });
+        }
+    }
+    out.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    out.truncate(limit);
     Ok(out)
 }
 
@@ -218,6 +285,16 @@ mod tests {
         assert_eq!(tree[0].children.len(), 1);
         let radius = blast_radius(&store, "a").unwrap();
         assert!(radius.len() <= 2);
+    }
+
+    #[test]
+    fn every_call_site_in_one_function_is_reported() {
+        // Two calls to the same symbol in one function are two affected
+        // places; the function is expanded upward only once.
+        let (_d, store) = setup("fn leaf() {}\nfn mid() {\n    leaf();\n    leaf();\n}\n");
+        let radius = blast_radius(&store, "leaf").unwrap();
+        assert_eq!(radius.len(), 2, "{radius:#?}");
+        assert!(radius.iter().all(|a| a.depth == 1));
     }
 
     #[test]
