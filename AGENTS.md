@@ -35,7 +35,15 @@ zcode — `~/.zcode/cli/config.json`, ключ `servers` (формат пров�
 ```json
 { "servers": { "codeindex": {
     "command": "/path/to/codeindex",
-    "args": ["serve", "/media/veracrypt3/Developer/codeindex"]
+    "args": ["serve", "/media/veracrypt3/Developer/codeindex", "--semantic"],
+    "env": {
+        "CODEINDEX_YANTRIK_URL": "http://127.0.0.1:7442",
+        "CODEINDEX_YANTRIK_TOKEN": "ydb_…",
+        "CODEINDEX_YANTRIK_NAMESPACE": "codeindex",
+        "CODEINDEX_YANTRIK_DOMAIN": "code",
+        "CODEINDEX_EMBED_URL": "http://127.0.0.1:11434",
+        "CODEINDEX_EMBED_MODEL": "bge-m3"
+    }
 } } }
 ```
 
@@ -45,7 +53,13 @@ opencode — `~/.config/opencode/cli.json` (или `opencode.json`), ключ
 ```json
 { "mcp": { "codeindex": {
     "type": "local",
-    "command": ["/path/to/codeindex", "serve", "/path/to/repo"],
+    "command": ["/path/to/codeindex", "serve", "/path/to/repo", "--semantic"],
+    "environment": {
+        "CODEINDEX_YANTRIK_URL": "http://127.0.0.1:7442",
+        "CODEINDEX_YANTRIK_TOKEN": "ydb_…",
+        "CODEINDEX_EMBED_URL": "http://127.0.0.1:11434",
+        "CODEINDEX_EMBED_MODEL": "bge-m3"
+    },
     "enabled": true
 } } }
 ```
