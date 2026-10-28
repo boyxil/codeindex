@@ -2,6 +2,7 @@
 //! M0: walk a Rust tree, lex every file with the in-house lexer,
 //! report the symbol inventory.
 //! M1: incremental SQLite index at <path>/.codeindex/index.db.
+//! M2: queries over the store — search, definition, candidate callers.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -26,6 +27,28 @@ enum Command {
     Index {
         /// Repository root.
         path: PathBuf,
+    },
+    /// Find symbols whose name contains the query (case-insensitive).
+    Search {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Substring of a symbol name.
+        query: String,
+    },
+    /// Show where a symbol with this exact name is defined.
+    Definition {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact symbol name.
+        name: String,
+    },
+    /// List call sites invoking this name (candidate tier until the
+    /// M3 resolver confirms them).
+    Callers {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact callee name.
+        name: String,
     },
 }
 
@@ -69,6 +92,34 @@ fn main() -> Result<()> {
                 stats.removed,
                 stats.symbols
             );
+        }
+        Command::Search { path, query } => {
+            let store = codeindex::store::Store::open(&path.join(".codeindex/index.db"))?;
+            let hits = store.search_symbols(&query)?;
+            println!("{} matches for \"{}\":", hits.len(), query);
+            for s in &hits {
+                println!("  {:>7} {} {}:{}", s.kind, s.name, s.file, s.line);
+            }
+        }
+        Command::Definition { path, name } => {
+            let store = codeindex::store::Store::open(&path.join(".codeindex/index.db"))?;
+            let defs = store.definitions(&name)?;
+            match defs.len() {
+                0 => println!("no symbol named \"{name}\""),
+                1 => println!("1 definition:"),
+                n => println!("{n} definitions (the resolver will disambiguate in M3):"),
+            }
+            for s in &defs {
+                println!("  {:>7} {} {}:{}", s.kind, s.name, s.file, s.line);
+            }
+        }
+        Command::Callers { path, name } => {
+            let store = codeindex::store::Store::open(&path.join(".codeindex/index.db"))?;
+            let refs = store.callers(&name)?;
+            println!("{} call site(s) of \"{name}\":", refs.len());
+            for r in &refs {
+                println!("  {}:{} ({})", r.file, r.line, r.tier);
+            }
         }
     }
     Ok(())

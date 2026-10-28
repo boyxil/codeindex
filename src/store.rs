@@ -12,6 +12,17 @@ use std::path::Path;
 
 pub const SCHEMA_VERSION: &str = "1";
 
+/// What the extractor writes per file (symbols since M1, call edges
+/// since M2). Unlike schema_version this describes the *derived* data:
+/// bumping it makes stored hashes stale as parse decisions, so the next
+/// index run re-parses everything once.
+pub const EXTRACTOR_VERSION: &str = "2";
+
+/// Tier of an edge, per the project's honesty rule. M2 only ever writes
+/// `candidate` (name-shaped call sites); `resolved`/`unresolved` arrive
+/// with the M3 name resolver.
+pub const TIER_CANDIDATE: &str = "candidate";
+
 /// One indexed symbol joined with its file — the minimal read API M2
 /// queries grow from.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +32,14 @@ pub struct IndexedSymbol {
     pub name: String,
     pub kind: String,
     pub line: i64,
+}
+
+/// One call site found for a callee name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallRef {
+    pub file: String,
+    pub line: i64,
+    pub tier: String,
 }
 
 pub struct Store {
@@ -70,7 +89,16 @@ impl Store {
                  line INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
-             CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);",
+             CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
+             CREATE TABLE IF NOT EXISTS edges (
+                 id INTEGER PRIMARY KEY,
+                 src_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 src_line INTEGER NOT NULL,
+                 callee TEXT NOT NULL,
+                 tier TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_edges_callee ON edges(callee);
+             CREATE INDEX IF NOT EXISTS idx_edges_file_id ON edges(src_file_id);",
         )?;
         let stored: Option<String> = conn
             .query_row(
@@ -107,15 +135,16 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Upsert one file and replace its symbol rows wholesale. Per-file
-    /// wholesale replacement keeps the parse-and-store step free of
-    /// line-level diffing — the hash already decided the file changed.
+    /// Upsert one file and replace its symbol and edge rows wholesale.
+    /// Per-file wholesale replacement keeps the parse-and-store step free
+    /// of line-level diffing — the hash already decided the file changed.
     pub fn replace_file(
         &self,
         path: &str,
         hash: &str,
         mtime: i64,
         symbols: &[super::Symbol],
+        calls: &[super::CallSite],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -128,6 +157,7 @@ impl Store {
                 r.get(0)
             })?;
         tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+        tx.execute("DELETE FROM edges WHERE src_file_id = ?1", params![file_id])?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO symbols(file_id, name, kind, line) VALUES (?1, ?2, ?3, ?4)",
@@ -136,14 +166,48 @@ impl Store {
                 stmt.execute(params![file_id, s.name, s.kind, s.line as i64])?;
             }
         }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO edges(src_file_id, src_line, callee, tier) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for c in calls {
+                stmt.execute(params![file_id, c.line as i64, c.callee, TIER_CANDIDATE])?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
 
-    /// Drop a file and (via cascade) its symbols.
+    /// Drop a file and (via cascade) its symbols and edges.
     pub fn remove_file(&self, path: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// True when the store was written by the extractor this build runs.
+    pub fn extractor_is_current(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'extractor_version'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(EXTRACTOR_VERSION)
+    }
+
+    /// Record the extractor version the store has been written with.
+    /// Public so tests can simulate older builds.
+    pub fn set_extractor_version(&self, version: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('extractor_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![version],
+        )?;
         Ok(())
     }
 
@@ -168,6 +232,61 @@ impl Store {
                 name: r.get(1)?,
                 kind: r.get(2)?,
                 line: r.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Substring, case-insensitive match on the symbol name. Filtering
+    /// happens in Rust rather than SQL: a `%needle%` LIKE cannot use the
+    /// name index anyway, and Rust lowercasing is Unicode-correct where
+    /// SQLite's is ASCII-only.
+    pub fn search_symbols(&self, query: &str) -> Result<Vec<IndexedSymbol>> {
+        let needle = query.to_lowercase();
+        Ok(self
+            .symbols()?
+            .into_iter()
+            .filter(|s| s.name.to_lowercase().contains(&needle))
+            .collect())
+    }
+
+    /// Exact-name definitions; a name may legitimately exist in several
+    /// modules — all are reported until the M3 resolver disambiguates.
+    pub fn definitions(&self, name: &str) -> Result<Vec<IndexedSymbol>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, s.name, s.kind, s.line
+             FROM symbols s JOIN files f ON f.id = s.file_id
+             WHERE s.name = ?1
+             ORDER BY f.path, s.line",
+        )?;
+        let rows = stmt.query_map(params![name], |r| {
+            Ok(IndexedSymbol {
+                file: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                line: r.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Call sites whose written name equals `callee`, deduplicated per
+    /// (file, line). Tier is carried through verbatim — callers of the
+    /// API decide how much to trust a `candidate`.
+    pub fn callers(&self, callee: &str) -> Result<Vec<CallRef>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT f.path, e.src_line, e.tier
+             FROM edges e JOIN files f ON f.id = e.src_file_id
+             WHERE e.callee = ?1
+             ORDER BY f.path, e.src_line",
+        )?;
+        let rows = stmt.query_map(params![callee], |r| {
+            Ok(CallRef {
+                file: r.get(0)?,
+                line: r.get(1)?,
+                tier: r.get(2)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -225,10 +344,14 @@ mod tests {
                 })
                 .collect()
         };
-        store.replace_file("a.rs", "h1", 1, &syms(&["f", "g"])).unwrap();
+        store
+            .replace_file("a.rs", "h1", 1, &syms(&["f", "g"]), &[])
+            .unwrap();
         // Same path, changed content: row count must stay 1, symbols
         // replaced wholesale.
-        store.replace_file("a.rs", "h2", 2, &syms(&["h"])).unwrap();
+        store
+            .replace_file("a.rs", "h2", 2, &syms(&["h"]), &[])
+            .unwrap();
         assert_eq!(store.symbol_count().unwrap(), 1);
         let all = store.symbols().unwrap();
         assert_eq!(all.len(), 1);
@@ -246,9 +369,99 @@ mod tests {
             file: "a.rs".into(),
             line: 1,
         };
-        store.replace_file("a.rs", "h1", 1, &[sym]).unwrap();
+        store.replace_file("a.rs", "h1", 1, &[sym], &[]).unwrap();
         store.remove_file("a.rs").unwrap();
         assert_eq!(store.symbol_count().unwrap(), 0);
         assert!(store.file_hashes().unwrap().is_empty());
+    }
+
+    fn calls(items: &[(&str, usize)]) -> Vec<super::super::CallSite> {
+        items
+            .iter()
+            .map(|(n, l)| super::super::CallSite {
+                callee: n.to_string(),
+                line: *l,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edges_follow_their_file_through_replacement_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_tmp(dir.path());
+        store
+            .replace_file(
+                "a.rs",
+                "h1",
+                1,
+                &[],
+                &calls(&[("target", 3), ("other", 4)]),
+            )
+            .unwrap();
+        assert_eq!(
+            store.callers("target").unwrap(),
+            vec![CallRef {
+                file: "a.rs".into(),
+                line: 3,
+                tier: "candidate".into()
+            }]
+        );
+        // Content replaced: the old edge set must not survive.
+        store
+            .replace_file("a.rs", "h2", 2, &[], &calls(&[("target", 7)]))
+            .unwrap();
+        assert_eq!(
+            store.callers("target").unwrap(),
+            vec![CallRef {
+                file: "a.rs".into(),
+                line: 7,
+                tier: "candidate".into()
+            }]
+        );
+        assert!(store.callers("other").unwrap().is_empty());
+        store.remove_file("a.rs").unwrap();
+        assert!(store.callers("target").unwrap().is_empty());
+    }
+
+    #[test]
+    fn callers_are_deduplicated_per_file_and_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_tmp(dir.path());
+        // f(); f(); f(); — same line twice, then another line.
+        store
+            .replace_file("a.rs", "h1", 1, &[], &calls(&[("f", 1), ("f", 1), ("f", 2)]))
+            .unwrap();
+        assert_eq!(store.callers("f").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn search_is_substring_case_insensitive_definitions_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_tmp(dir.path());
+        let sym = |name: &str, kind: &'static str| super::super::Symbol {
+            name: name.to_string(),
+            kind,
+            file: "t.rs".into(),
+            line: 1,
+        };
+        store
+            .replace_file("t.rs", "h", 1, &[sym("Alpha", "fn"), sym("alphabet", "fn")], &[])
+            .unwrap();
+        let hits = store.search_symbols("ALP").unwrap();
+        assert_eq!(hits.len(), 2);
+        // Exact lookup is case-sensitive: names are code, not prose.
+        assert_eq!(store.definitions("Alpha").unwrap().len(), 1);
+        assert!(store.definitions("alpha").unwrap().is_empty());
+        assert!(store.definitions("Beta").unwrap().is_empty());
+    }
+
+    #[test]
+    fn extractor_version_is_sticky_per_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_tmp(dir.path());
+        // A store fresh from M1 days has no extractor key at all.
+        assert!(!store.extractor_is_current());
+        store.set_extractor_version(EXTRACTOR_VERSION).unwrap();
+        assert!(store.extractor_is_current());
     }
 }

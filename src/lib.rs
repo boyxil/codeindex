@@ -18,7 +18,7 @@ pub mod store;
 use anyhow::Context;
 use lexer::{lex, text, Tok};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// One extracted symbol.
@@ -29,6 +29,14 @@ pub struct Symbol {
     pub kind: &'static str,
     pub file: PathBuf,
     /// 1-based line of the item's start.
+    pub line: usize,
+}
+
+/// One extracted call site: a name lexically used as a call.
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    pub callee: String,
+    /// 1-based line of the callee name token.
     pub line: usize,
 }
 
@@ -89,6 +97,105 @@ enum ItemKind {
     Impl,
 }
 
+/// Identifiers that legitimately precede `Name(` without being callers:
+/// tuple-struct and fn-item definition shapes.
+const CALL_BLOCKERS: &[&str] = &["fn", "struct", "enum", "union"];
+
+/// Rust keywords — never call names. Includes the `Fn` family: in real
+/// code it only appears in type position (`Box<dyn Fn(u8)>`) yet lexes
+/// exactly like a call.
+const KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn",
+    "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
+    "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "union", "unsafe", "use", "where", "while", "Fn", "FnMut", "FnOnce",
+];
+
+fn is_punct(src: &str, t: &lexer::Token, p: &str) -> bool {
+    t.kind == Tok::Punct && text(src, t) == p
+}
+
+/// Index of the token after the `>` closing the angle group that opens
+/// at `start` (`tokens[start]` is `<`); nested groups count.
+fn skip_angle_group(tokens: &[lexer::Token], src: &str, start: usize) -> usize {
+    let mut depth = 0i32;
+    let mut j = start;
+    while j < tokens.len() {
+        let t = &tokens[j];
+        if t.kind == Tok::Punct {
+            match text(src, t) {
+                "<" => depth += 1,
+                ">" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    tokens.len()
+}
+
+/// Token-level call-site extraction. A name is a candidate callee when
+/// a `(` follows it — directly (`foo(x)`, `x.foo()`), or as the last
+/// path segment (`std::mem::drop`, which the plain scan simply arrives
+/// at). The one shape a linear scan cannot reach is the turbofish
+/// `zero::<i32>()` — no ident sits before the paren — so it gets
+/// explicit handling. Definition shapes (`fn f(`, `struct P(`) are
+/// excluded; everything found is a *candidate* until the M3 resolver
+/// says otherwise. The lexer emits `::` as two `:` tokens, hence the
+/// paired checks.
+pub fn extract_calls(tokens: &[lexer::Token], src: &str) -> Vec<CallSite> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if tok.kind != Tok::Ident || KEYWORDS.contains(&text(src, tok)) {
+            i += 1;
+            continue;
+        }
+        if i > 0
+            && tokens[i - 1].kind == Tok::Ident
+            && CALL_BLOCKERS.contains(&text(src, &tokens[i - 1]))
+        {
+            i += 1;
+            continue;
+        }
+        match tokens.get(i + 1) {
+            Some(t) if is_punct(src, t, "(") => {
+                out.push(CallSite {
+                    callee: text(src, tok).to_string(),
+                    line: tok.line,
+                });
+            }
+            Some(t)
+                if is_punct(src, t, ":")
+                    && tokens.get(i + 2).is_some_and(|t| is_punct(src, t, ":"))
+                    && tokens.get(i + 3).is_some_and(|t| is_punct(src, t, "<")) =>
+            {
+                // Turbofish. A `fn() -> u8` inside the generics breaks
+                // the angle matching (the `->` yields a bare `>`), so
+                // such call sites are missed — accepted imprecision.
+                let after = skip_angle_group(tokens, src, i + 3);
+                if tokens.get(after).is_some_and(|t| is_punct(src, t, "(")) {
+                    out.push(CallSite {
+                        callee: text(src, tok).to_string(),
+                        line: tok.line,
+                    });
+                    i = after; // resume past the paren
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Walk `root` for *.rs files (skipping target/, .git/, .codeindex/),
 /// lex each file, extract item declarations.
 pub fn scan(root: &Path) -> anyhow::Result<Inventory> {
@@ -124,6 +231,12 @@ pub struct IndexStats {
 /// still be caught. Files present in the store but absent on disk are
 /// dropped. Paths are stored relative to the root so the index survives
 /// moving the checkout.
+///
+/// A changed extractor (new fields stored per file — symbols gained a
+/// companion, M2 added call edges) changes what is stored *without
+/// touching the files*, so the stored hashes go stale as parse
+/// decisions. `extractor_version` in meta tracks that: on mismatch the
+/// whole tree is re-parsed once and the key is bumped.
 pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
     let db = root.join(".codeindex").join("index.db");
     let store = store::Store::open(&db)?;
@@ -132,7 +245,11 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
         files_seen: files.len(),
         ..Default::default()
     };
-    let known = store.file_hashes()?;
+    let known = if store.extractor_is_current() {
+        store.file_hashes()?
+    } else {
+        HashMap::new()
+    };
     let mut seen: HashSet<String> = HashSet::with_capacity(files.len());
 
     for file in files {
@@ -154,9 +271,11 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let tokens = lex(&src);
         let mut symbols = Vec::new();
-        extract_items(&lex(&src), &src, &file, &mut symbols);
-        store.replace_file(&rel, &hash, mtime, &symbols)?;
+        extract_items(&tokens, &src, &file, &mut symbols);
+        let calls = extract_calls(&tokens, &src);
+        store.replace_file(&rel, &hash, mtime, &symbols, &calls)?;
         stats.parsed += 1;
     }
 
@@ -166,6 +285,7 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
             stats.removed += 1;
         }
     }
+    store.set_extractor_version(store::EXTRACTOR_VERSION)?;
     stats.symbols = store.symbol_count()?;
     Ok(stats)
 }
@@ -439,5 +559,81 @@ mod tests {
         let sym = &all[0];
         assert_eq!(sym.file, "src/lib.rs");
         assert_eq!(sym.line, 1);
+    }
+
+    #[test]
+    fn calls_are_extracted_with_guards() {
+        let src = concat!(
+            "\n",
+            "fn target() {}\n",              // 2: definition, not a call
+            "struct Point(i32, i32);\n",     // 3: definition, not a call
+            "let a = compute(1);\n",         // 4
+            "v.push(item());\n",             // 5: method + plain call
+            "let d = std::mem::drop(x);\n",  // 6: path — last segment wins
+            "let z = zero::<i32>(2);\n",     // 7: turbofish
+            "if ready() { return; }\n",      // 8: call after a keyword
+            "let f: Box<fn(u8) -> u8> = None;\n", // 9: fn-pointer type
+            "let q = Point(3, 4);\n",        // 10: tuple-struct construction
+            "obj.method(arg);\n",            // 11
+            "let s = S { field: 1 };\n",     // 12: struct literal, no call
+        );
+        let found = extract_calls(&lex(src), src);
+        let calls: Vec<(&str, usize)> = found
+            .iter()
+            .map(|c| (c.callee.as_str(), c.line))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("compute", 4),
+                ("push", 5),
+                ("item", 5),
+                ("drop", 6),
+                ("zero", 7),
+                ("ready", 8),
+                ("Point", 10),
+                ("method", 11),
+            ]
+        );
+    }
+
+    #[test]
+    fn index_fills_candidate_edges_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a.rs"), "fn target() {}\n");
+        write(&dir.path().join("b.rs"), "fn go() {\n    target();\n}\n");
+        index(dir.path()).unwrap();
+
+        let store = store::Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        assert_eq!(
+            store.callers("target").unwrap(),
+            vec![store::CallRef {
+                file: "b.rs".into(),
+                line: 2,
+                tier: "candidate".into()
+            }]
+        );
+        assert!(store.callers("go").unwrap().is_empty());
+        let defs = store.definitions("target").unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].file, "a.rs");
+        assert_eq!(defs[0].kind, "fn");
+    }
+
+    #[test]
+    fn stale_extractor_version_forces_full_reparse() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a.rs"), "fn one() {}\n");
+        assert_eq!(index(dir.path()).unwrap().parsed, 1);
+        assert_eq!(index(dir.path()).unwrap().parsed, 0);
+
+        // A build with a different extractor changes what is stored per
+        // file without touching files — hashes must go stale.
+        let store = store::Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        store.set_extractor_version("0").unwrap();
+        drop(store);
+        let s = index(dir.path()).unwrap();
+        assert_eq!(s.parsed, 1);
+        assert_eq!(s.unchanged, 0);
     }
 }
