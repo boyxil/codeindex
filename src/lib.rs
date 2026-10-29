@@ -12,6 +12,7 @@
 //! M2 adds queries and lexical call-site candidates;
 //! M3 adds the in-house name resolver (use-tree + module tree).
 
+pub mod lang;
 pub mod lexer;
 pub mod mcp;
 pub mod query;
@@ -307,7 +308,20 @@ pub fn scan(root: &Path) -> anyhow::Result<Inventory> {
         };
         let src = String::from_utf8_lossy(&bytes);
         inv.files += 1;
-        extract_items(&lex(&src), &src, &file, &mut inv.symbols, &mut Vec::new());
+        if lang::detect(&file).map(|l| l.name) == Some("rust") {
+            extract_items(&lex(&src), &src, &file, &mut inv.symbols, &mut Vec::new());
+        } else if let Some(lang_def) = lang::detect(&file) {
+            for item in lang::scan(&src, lang_def) {
+                inv.symbols.push(Symbol {
+                    name: item.name,
+                    kind: item.kind,
+                    file: file.to_path_buf(),
+                    line: item.line,
+                    end_line: item.line,
+                    signature: item.signature,
+                });
+            }
+        }
     }
     Ok(inv)
 }
@@ -413,12 +427,32 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
             .get(rel)
             .cloned()
             .unwrap_or_else(|| "crate".to_string());
+        let lang_detected = lang::detect(file);
+        let is_rust = lang_detected.map(|l| l.name) == Some("rust");
         let tokens = lex(&src);
         let mut symbols = Vec::new();
         let mut bindings = Vec::new();
-        extract_items(&tokens, &src, file, &mut symbols, &mut bindings);
-        let calls = extract_calls(&tokens, &src);
-        let scopes = scopes::extract_scopes(&tokens, &src);
+        let mut calls = Vec::new();
+        let scopes = if is_rust {
+            scopes::extract_scopes(&tokens, &src)
+        } else {
+            Default::default()
+        };
+        if is_rust {
+            extract_items(&tokens, &src, file, &mut symbols, &mut bindings);
+            calls = extract_calls(&tokens, &src);
+        } else if let Some(lang_def) = lang_detected {
+            for item in lang::scan(&src, lang_def) {
+                symbols.push(Symbol {
+                    name: item.name,
+                    kind: item.kind,
+                    file: file.to_path_buf(),
+                    line: item.line,
+                    end_line: item.line,
+                    signature: item.signature,
+                });
+            }
+        }
         store.replace_file(
             rel, &hash, mtime, &module, &symbols, &calls, &scopes, &bindings,
         )?;
@@ -684,7 +718,7 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
                 if name != "target" && name != ".git" && name != ".codeindex" {
                     walk(&path, out);
                 }
-            } else if path.extension().is_some_and(|x| x == "rs") {
+            } else if lang::detect(&path).is_some() {
                 out.push(path);
             }
         }
@@ -1388,6 +1422,26 @@ const S: &str = \"заявка…完成\";
         // `self.field.c()` — the receiver is a field, not self.
         assert_eq!(calls[1].callee, "c");
         assert_eq!(calls[1].kind, CallKind::Method);
+    }
+
+    #[test]
+    fn multi_language_directory_is_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("main.rs"), "fn main() {}\n");
+        write(&dir.path().join("app.py"), "def run(): pass\n");
+        write(&dir.path().join("server.go"), "func serve() {}\n");
+        write(&dir.path().join("util.ts"), "function help(): void {}\n");
+        write(&dir.path().join("README.md"), "# docs\n");
+        let inv = scan(dir.path()).unwrap();
+        assert_eq!(inv.files, 4); // README.md is not indexed
+        let kinds: Vec<&str> = inv.symbols.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&"fn")); // Rust
+        assert!(kinds.contains(&"def")); // Python
+        assert!(kinds.contains(&"func")); // Go + TS
+        assert!(inv.symbols.iter().any(|s| s.name == "run"));
+        assert!(inv.symbols.iter().any(|s| s.name == "serve"));
+        assert!(inv.symbols.iter().any(|s| s.name == "help"));
+        assert!(inv.symbols.iter().any(|s| s.name == "main"));
     }
 
     #[test]
