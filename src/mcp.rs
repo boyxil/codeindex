@@ -59,7 +59,7 @@ impl McpServer {
     pub fn new(root: PathBuf, refresh: bool, semantic: bool) -> McpServer {
         let db_path = root.join(".codeindex").join("index.db");
         let semantic = if semantic {
-            yantrik::Config::from_env().map(yantrik::Client::new)
+            yantrik::Config::for_root(&root).map(yantrik::Client::new)
         } else {
             None
         };

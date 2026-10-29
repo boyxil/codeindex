@@ -876,6 +876,9 @@ fn extract_items(
     bindings: &mut Vec<resolve::LocalBinding>,
 ) {
     let lines: Vec<&str> = src.lines().collect();
+    // Open `impl` blocks: (type name, index of the closing brace). Consts
+    // and statics declared inside get qualified names (`Type::NAME`).
+    let mut impl_stack: Vec<(String, usize)> = Vec::new();
     let signature = |line: usize| -> String {
         let decl = lines
             .get(line.saturating_sub(1))
@@ -947,7 +950,20 @@ fn extract_items(
                 let end_line = body
                     .map(|(_, close)| tokens[close].line)
                     .unwrap_or(tok.line);
-                let name = text(src, next).to_string();
+                let mut name = text(src, next).to_string();
+                // An associated const/static belongs to its type: index it
+                // as `Type::NAME`, same as enum variants.
+                while let Some((_, close)) = impl_stack.last() {
+                    if i < *close {
+                        if matches!(*kw, "const" | "static") {
+                            if let Some((type_name, _)) = impl_stack.last() {
+                                name = format!("{}::{}", type_name, name);
+                            }
+                        }
+                        break;
+                    }
+                    impl_stack.pop();
+                }
                 out.push(Symbol {
                     name: name.clone(),
                     kind: kw,
@@ -994,13 +1010,17 @@ fn extract_items(
                 // `where`-clause rules (`impl<T> Pair<T>` names `Pair`).
                 if let Some(header) = scopes::impl_header(tokens, src, i) {
                     out.push(Symbol {
-                        name: header.type_name,
+                        name: header.type_name.clone(),
                         kind: "impl",
                         file: file.to_path_buf(),
                         line: tok.line,
                         end_line: tok.line,
                         signature: signature(tok.line),
                     });
+                    // Track the block so nested consts qualify.
+                    if let Some(close) = scopes::matching_brace(tokens, src, header.brace) {
+                        impl_stack.push((header.type_name.clone(), close));
+                    }
                     i = header.brace; // resume inside the impl body
                     continue;
                 }
@@ -1337,6 +1357,20 @@ const S: &str = \"заявка…完成\";
         );
         let names: Vec<&str> = syms.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["LIMIT", "COUNTER", "Alias", "f"]);
+    }
+
+    #[test]
+    fn impl_consts_are_qualified_with_their_type() {
+        let syms = symbols(
+            "struct Store;\nimpl Store {\n    const MAX: u8 = 7;\n    fn get(&self) -> u8 { Self::MAX }\n}\n",
+        );
+        assert!(
+            syms.iter()
+                .any(|(n, k)| *n == "Store::MAX" && *k == "const"),
+            "{syms:?}"
+        );
+        // The const inside the fn body is a plain nested item.
+        assert!(syms.iter().any(|(n, _)| *n == "get"));
     }
 
     #[test]

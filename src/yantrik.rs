@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::time::Duration;
 
 /// Connection settings, from the environment so the MCP server can be
@@ -40,6 +41,20 @@ pub struct Config {
 }
 
 impl Config {
+    /// One instance serves many repositories: unless the namespace is
+    /// pinned via env, it defaults to the checkout directory name, so
+    /// `codeindex` and `yantrikdb-server` never overwrite each other.
+    pub fn for_root(root: &Path) -> Option<Config> {
+        let mut cfg = Self::from_env()?;
+        if std::env::var("CODEINDEX_YANTRIK_NAMESPACE")
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
+            cfg.namespace = resolve_namespace(root, None);
+        }
+        Some(cfg)
+    }
+
     /// `None` when no instance is configured — the semantic layer is
     /// opt-in and silently absent, not silently degraded.
     pub fn from_env() -> Option<Config> {
@@ -122,6 +137,37 @@ pub fn symbol_key(row: &SemanticRow) -> String {
         row.file, row.kind, row.name, row.line, row.signature
     );
     crate::sha256_hex(material.as_bytes())[..16].to_string()
+}
+
+/// Namespace for a checkout: the env value when set, otherwise the
+/// directory name, sanitized for storage. Pure — testable.
+pub fn resolve_namespace(root: &Path, env_value: Option<&str>) -> String {
+    if let Some(value) = env_value.map(str::trim).filter(|v| !v.is_empty()) {
+        return value.to_string();
+    }
+    // Canonicalize when possible (a caller may pass "."), fall back to
+    // the literal path — the checkout may not exist yet.
+    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let name = base
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "default".to_string());
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if sanitized.is_empty() {
+        "default".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// A usable embedding: non-empty, finite and not the zero vector. Zero
@@ -849,6 +895,36 @@ mod tests {
             "fn lex(src: &str) -> Vec<Token> {"
         );
         assert!(parse_marker("just a memory").is_none());
+    }
+
+    #[test]
+    fn namespace_resolves_from_the_checkout_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let ns = resolve_namespace(dir.path(), None);
+        let expected = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let expected: String = expected
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        assert_eq!(ns, expected);
+        // Env override wins; weird checkout names are sanitized.
+        assert_eq!(resolve_namespace(dir.path(), Some(" pinned ")), "pinned");
+        let weird = dir.path().join("my repo 2.0");
+        assert_eq!(resolve_namespace(&weird, None), "my_repo_2_0");
+        assert_eq!(resolve_namespace(Path::new("/"), None), "default");
     }
 
     #[test]

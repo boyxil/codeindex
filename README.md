@@ -33,6 +33,9 @@ tree-sitter, stack-graphs и прочих парсинг-зависимосте�
   `not-found-in-scope`, `no-such-fn-in-impl`, `not-a-function`,
   `not-found-in-module`, `ambiguous`).
 
+Ассоциированные константы и статики индексируются квалифицированно
+(`Store::MAX`), включая резолв через `use` — как варианты enum.
+
 Кроме того, у `unresolved`-рёбер, чей путь начинается не с локального
 модуля, записывается **внешний крейт** (`std` в `std::mem::drop`,
 `serde` в `use serde::Serialize`). Это метка, а не резолюция: tier
@@ -109,6 +112,10 @@ set -a; . ./codeindex.env; set +a      # CODEINDEX_YANTRIK_URL/TOKEN/NAMESPACE
 codeindex index . --semantic
 codeindex search . "resolve use statements" --semantic
 ```
+
+Инстанс мультирепозиторный: namespace по умолчанию — имя каталога
+репозитория (переопределяется `CODEINDEX_YANTRIK_NAMESPACE`), поэтому
+несколько проектов живут в одном инстансе, не затирая друг друга.
 
 Инстанс работает в режиме `client_only` — он хранилище, а не эмбеддер:
 векторы считает Ollama (`bge-m3`, 1024d) и присылает их с каждой записью

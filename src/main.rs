@@ -344,7 +344,7 @@ fn main() -> Result<()> {
         } => {
             if semantic {
                 let store = open(&path)?;
-                let client = yantrik_client()?;
+                let client = yantrik_client(&path)?;
                 let hits = codeindex::yantrik::hybrid_search(&store, &client, &query, 20)?;
                 emit(
                     json_mode,
@@ -876,8 +876,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn yantrik_client() -> Result<codeindex::yantrik::Client> {
-    let cfg = codeindex::yantrik::Config::from_env().ok_or_else(|| {
+fn yantrik_client(path: &Path) -> Result<codeindex::yantrik::Client> {
+    let cfg = codeindex::yantrik::Config::for_root(path).ok_or_else(|| {
         anyhow::anyhow!(
             "semantic layer not configured: set CODEINDEX_YANTRIK_URL (and CODEINDEX_YANTRIK_TOKEN)"
         )
@@ -887,7 +887,7 @@ fn yantrik_client() -> Result<codeindex::yantrik::Client> {
 
 fn sync_semantic(path: &Path, json_mode: bool) -> Result<()> {
     let store = open(path)?;
-    let client = yantrik_client()?;
+    let client = yantrik_client(path)?;
     let stats = codeindex::yantrik::sync(&store, &client)?;
     emit(
         json_mode,

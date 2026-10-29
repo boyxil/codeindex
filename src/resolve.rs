@@ -240,6 +240,25 @@ impl Resolver {
                     module,
                 });
             }
+            // Associated consts/statics of `impl Type` blocks register as
+            // qualified children (`Store::MAX`), same as enum variants.
+            for imp in &f.impl_spans {
+                let module = deepen(&f.module, &f.module_spans, imp.start_line as i64);
+                for s in f.symbols.iter().filter(|s| {
+                    matches!(s.kind.as_str(), "const" | "static")
+                        && (imp.start_line as i64) < s.line
+                        && s.line <= imp.end_line as i64
+                }) {
+                    program.items.entry(module.clone()).or_default().push(Item {
+                        name: format!("{}::{}", imp.type_name, s.name),
+                        kind: s.kind.clone(),
+                        file_id: f.file_id,
+                        line: s.line,
+                        in_body: true,
+                        module: module.clone(),
+                    });
+                }
+            }
             // Trait methods are not module-scope names, but `Trait::method`
             // and `use Trait::method` do reach them: register them as
             // qualified items in the trait's own module.
@@ -1010,6 +1029,56 @@ mod tests {
         let edge = at(&e, "b/src/lib.rs", 2);
         assert_eq!(edge.tier, TIER_RESOLVED);
         assert_eq!(edge.target, Some(("a/src/lib.rs".into(), 1)));
+    }
+
+    #[test]
+    fn imported_associated_consts_resolve() {
+        // Direct resolver fixture: `use crate::a::Store::MAX` in crate::b
+        // must resolve to the qualified const in crate::a.
+        let fd_a = FileData {
+            file_id: 1,
+            module: "crate::a".into(),
+            symbols: vec![
+                SymRow {
+                    name: "Store".into(),
+                    kind: "struct".into(),
+                    line: 1,
+                    end_line: 1,
+                },
+                SymRow {
+                    name: "MAX".into(),
+                    kind: "const".into(),
+                    line: 3,
+                    end_line: 3,
+                },
+            ],
+            impl_spans: vec![ImplSpan {
+                type_name: "Store".into(),
+                trait_name: None,
+                start_line: 2,
+                end_line: 4,
+            }],
+            ..Default::default()
+        };
+        let fd_b = FileData {
+            file_id: 2,
+            module: "crate::b".into(),
+            uses: vec![crate::scopes::UseDecl {
+                path: "crate::a::Store::MAX".into(),
+                alias: "MAX".into(),
+                glob: false,
+                line: 1,
+            }],
+            ..Default::default()
+        };
+        let resolver = Resolver::build(vec![fd_a, fd_b], HashMap::new());
+        match resolver.resolve_path("crate::a::Store::MAX", "crate::b") {
+            Some(Binding::Item(it)) => {
+                assert_eq!(it.kind, "const");
+                assert_eq!(it.line, 3);
+            }
+            other => panic!("expected the qualified const, got {other:?}"),
+        }
     }
 
     #[test]
