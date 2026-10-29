@@ -67,6 +67,88 @@ pub static LANGS: &[LangDef] = &[
         ],
         modifiers: &[],
     },
+    LangDef {
+        name: "kotlin",
+        extensions: &["kt", "kts"],
+        line_comment: "//",
+        decls: &[
+            ("fun", "fun"),
+            ("class", "class"),
+            ("interface", "interface"),
+            ("object", "object"),
+        ],
+        modifiers: &[
+            "public",
+            "private",
+            "internal",
+            "protected",
+            "open",
+            "abstract",
+            "override",
+            "suspend",
+            "inline",
+            "data",
+            "sealed",
+            "companion",
+            "const",
+        ],
+    },
+    LangDef {
+        name: "c",
+        extensions: &["c", "h"],
+        line_comment: "//",
+        decls: &[("struct", "struct"), ("enum", "enum"), ("union", "union")],
+        modifiers: &["static", "extern", "inline", "const"],
+    },
+    LangDef {
+        name: "cpp",
+        extensions: &["cpp", "hpp", "cc", "cxx"],
+        line_comment: "//",
+        decls: &[
+            ("class", "class"),
+            ("struct", "struct"),
+            ("namespace", "namespace"),
+            ("enum", "enum"),
+        ],
+        modifiers: &[
+            "static",
+            "extern",
+            "inline",
+            "const",
+            "virtual",
+            "explicit",
+            "constexpr",
+        ],
+    },
+    LangDef {
+        name: "java",
+        extensions: &["java"],
+        line_comment: "//",
+        decls: &[
+            ("class", "class"),
+            ("interface", "interface"),
+            ("enum", "enum"),
+            ("record", "record"),
+        ],
+        modifiers: &[
+            "public",
+            "private",
+            "protected",
+            "static",
+            "final",
+            "abstract",
+            "synchronized",
+            "native",
+            "sealed",
+        ],
+    },
+    LangDef {
+        name: "shell",
+        extensions: &["sh", "bash"],
+        line_comment: "#",
+        decls: &[("function", "function")],
+        modifiers: &["export", "readonly", "local"],
+    },
 ];
 
 /// Detect the language by file extension.
@@ -282,6 +364,45 @@ func (s *Server) Start() {}
     }
 
     #[test]
+    fn kotlin_java_c_cpp_shell_declarations_are_found() {
+        let kt = scan(
+            "data class User(val name: String)\nfun process(data: String) {}\nsuspend fun fetch(): String { return \"\" }\n",
+            lang("kotlin"),
+        );
+        let kn: Vec<&str> = kt.iter().map(|s| s.name.as_str()).collect();
+        assert!(kn.contains(&"User") && kn.contains(&"process") && kn.contains(&"fetch"));
+
+        let c = scan(
+            "struct Point { int x; };\nenum Color { RED };\nunion Value { int i; float f; };\n",
+            lang("c"),
+        );
+        let cn: Vec<&str> = c.iter().map(|s| s.name.as_str()).collect();
+        assert!(cn.contains(&"Point") && cn.contains(&"Color") && cn.contains(&"Value"));
+
+        let cpp = scan(
+            "namespace app {\nclass Engine {};\n}\nstruct Config { int timeout; };\n",
+            lang("cpp"),
+        );
+        let cp: Vec<&str> = cpp.iter().map(|s| s.name.as_str()).collect();
+        assert!(cp.contains(&"Engine"), "{cp:?}");
+        assert!(cp.contains(&"Config"));
+
+        let java = scan(
+            "public final class Api { }\ninterface Callback { void done(); }\nenum Status { OK }\n",
+            lang("java"),
+        );
+        let jn: Vec<&str> = java.iter().map(|s| s.name.as_str()).collect();
+        assert!(jn.contains(&"Api") && jn.contains(&"Callback") && jn.contains(&"Status"));
+
+        let sh = scan(
+            "function deploy() { echo \"go\"; }\nexport readonly MODE=prod\n",
+            lang("shell"),
+        );
+        let sn: Vec<&str> = sh.iter().map(|s| s.name.as_str()).collect();
+        assert!(sn.contains(&"deploy"), "{sn:?}");
+    }
+
+    #[test]
     fn detect_by_extension() {
         assert_eq!(detect(std::path::Path::new("a.rs")).unwrap().name, "rust");
         assert_eq!(detect(std::path::Path::new("a.py")).unwrap().name, "python");
@@ -290,6 +411,11 @@ func (s *Server) Start() {}
             "typescript"
         );
         assert_eq!(detect(std::path::Path::new("a.go")).unwrap().name, "go");
+        assert_eq!(detect(std::path::Path::new("a.kt")).unwrap().name, "kotlin");
+        assert_eq!(detect(std::path::Path::new("a.c")).unwrap().name, "c");
+        assert_eq!(detect(std::path::Path::new("a.cpp")).unwrap().name, "cpp");
+        assert_eq!(detect(std::path::Path::new("A.java")).unwrap().name, "java");
+        assert_eq!(detect(std::path::Path::new("a.sh")).unwrap().name, "shell");
         assert!(detect(std::path::Path::new("a.txt")).is_none());
     }
 }
