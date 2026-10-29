@@ -21,6 +21,10 @@
 # в каталоге деплоя (там, где лежат embedder/models):
 docker compose -f docker-compose.yantrik-code.yml up -d
 
+Политика рестарта `on-failure:20`: после загрузки ПК контейнер ретраится
+(с нарастающим интервалом, суммарно ~15 минут) пока не смонтируется
+том veracrypt, на котором лежат его данные и модели.
+
 # токен для codeindex (печатается один раз — сохранить):
 docker exec -u yantrikdb yantrikdb-code \
   yantrikdb token --data-dir /var/lib/yantrikdb create --db default --label codeindex

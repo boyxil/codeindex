@@ -6,7 +6,7 @@ services:
   yantrikdb-code:
     image: localhost/yantrikdb-server:multilingual
     container_name: yantrikdb-code
-    restart: unless-stopped
+    restart: on-failure:20
     ports:
       - "127.0.0.1:7442:7438"
     volumes:
