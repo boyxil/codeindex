@@ -18,13 +18,13 @@ use std::path::Path;
 use crate::resolve::{self, EdgeRow, FileData, Resolution, SymRow};
 use crate::scopes::Scopes;
 
-pub const SCHEMA_VERSION: &str = "6";
+pub const SCHEMA_VERSION: &str = "7";
 
 /// What the extractor writes per file (symbols+edges since M2, call
 /// scopes since M3). Unlike schema_version this describes the *derived*
 /// data: bumping it makes stored hashes stale as parse decisions, so the
 /// next index run re-parses everything once.
-pub const EXTRACTOR_VERSION: &str = "9";
+pub const EXTRACTOR_VERSION: &str = "10";
 
 /// One indexed symbol joined with its file — the read API M2 queries
 /// grow from.
@@ -45,6 +45,8 @@ pub struct CallRef {
     pub tier: String,
     pub target: Option<(String, i64)>,
     pub reason: Option<String>,
+    /// Root of an unresolved path that is not local (`std`, `serde`, …).
+    pub external_crate: Option<String>,
 }
 
 /// A call edge with its resolution, for call-graph queries.
@@ -56,6 +58,7 @@ pub struct EdgeInfo {
     pub tier: String,
     pub target: Option<(String, i64)>,
     pub reason: Option<String>,
+    pub external_crate: Option<String>,
 }
 
 /// One symbol as the semantic layer sees it: the declaration line is the
@@ -157,7 +160,8 @@ impl Store {
                  tier TEXT NOT NULL,
                  resolved_file_id INTEGER REFERENCES files(id),
                  resolved_line INTEGER,
-                 reason TEXT
+                 reason TEXT,
+                 external_crate TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_edges_callee ON edges(callee);
              CREATE INDEX IF NOT EXISTS idx_edges_file_id ON edges(src_file_id);
@@ -207,8 +211,10 @@ impl Store {
                  path TEXT NOT NULL,
                  alias TEXT NOT NULL,
                  glob INTEGER NOT NULL,
-                 line INTEGER NOT NULL
-             );",
+                 line INTEGER NOT NULL,
+                 external_crate TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_imports_external ON imports(external_crate);",
         )?;
         if stored.is_none() {
             conn.execute(
@@ -579,7 +585,7 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "UPDATE edges SET tier = ?2, resolved_file_id = ?3,
-                 resolved_line = ?4, reason = ?5 WHERE id = ?1",
+                 resolved_line = ?4, reason = ?5, external_crate = ?6 WHERE id = ?1",
             )?;
             for (id, r) in updates {
                 stmt.execute(params![
@@ -587,7 +593,8 @@ impl Store {
                     r.tier,
                     r.target.map(|t| t.0),
                     r.target.map(|t| t.1),
-                    r.reason
+                    r.reason,
+                    r.external_crate
                 ])?;
             }
         }
@@ -879,7 +886,8 @@ impl Store {
     /// (file, line), carrying the resolution state verbatim.
     pub fn callers(&self, callee: &str) -> Result<Vec<CallRef>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT f.path, e.src_line, e.tier, tf.path, e.resolved_line, e.reason
+            "SELECT DISTINCT f.path, e.src_line, e.tier, tf.path, e.resolved_line, e.reason,
+                    e.external_crate
              FROM edges e
              JOIN files f ON f.id = e.src_file_id
              LEFT JOIN files tf ON tf.id = e.resolved_file_id
@@ -891,10 +899,115 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Every stored `use` row: `(id, file_id, line, path)`.
+    pub fn all_imports(&self) -> Result<Vec<(i64, i64, i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, file_id, line, path FROM imports")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Record which crate each import points at (NULL for local ones).
+    pub fn apply_import_externals(&self, updates: &[(i64, Option<String>)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE imports SET external_crate = ?2 WHERE id = ?1")?;
+            for (id, crate_name) in updates {
+                stmt.execute(params![id, crate_name])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// External crates called inside a span, most used first.
+    pub fn external_calls_in_span(
+        &self,
+        file: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.external_crate, COUNT(*) FROM edges e
+             JOIN files f ON f.id = e.src_file_id
+             WHERE f.path = ?1 AND e.src_line >= ?2 AND e.src_line <= ?3
+               AND e.external_crate IS NOT NULL
+             GROUP BY e.external_crate ORDER BY 2 DESC, 1",
+        )?;
+        let rows = stmt.query_map(params![file, start, end], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// External crates imported by one file, most used first.
+    pub fn external_imports_of(&self, file: &str) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.external_crate, COUNT(*) FROM imports i
+             JOIN files f ON f.id = i.file_id
+             WHERE f.path = ?1 AND i.external_crate IS NOT NULL
+             GROUP BY i.external_crate ORDER BY 2 DESC, 1",
+        )?;
+        let rows = stmt.query_map(params![file], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Edges that point outside the index (external crate label).
+    pub fn external_edge_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE external_crate IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Declaration text of one symbol row.
+    pub fn signature_at(&self, file: &str, line: i64, name: &str) -> Result<Option<String>> {
+        let sig = self
+            .conn
+            .query_row(
+                "SELECT s.signature FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE f.path = ?1 AND s.line = ?2 AND s.name = ?3 LIMIT 1",
+                params![file, line, name],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(sig)
+    }
+
+    /// Symbols declared inside a line span of one file — the raw material
+    /// for an outline.
+    pub fn symbols_in_span(&self, file: &str, start: i64, end: i64) -> Result<Vec<IndexedSymbol>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, s.name, s.kind, s.line FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE f.path = ?1 AND s.line > ?2 AND s.line <= ?3
+             ORDER BY s.line, s.name",
+        )?;
+        let rows = stmt.query_map(params![file, start, end], |r| {
+            Ok(IndexedSymbol {
+                file: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                line: r.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Every edge with its resolution — the call-graph query source.
     pub fn edges_with_resolution(&self) -> Result<Vec<EdgeInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT f.path, e.src_line, e.callee, e.tier, tf.path, e.resolved_line, e.reason
+            "SELECT f.path, e.src_line, e.callee, e.tier, tf.path, e.resolved_line, e.reason,
+                    e.external_crate
              FROM edges e
              JOIN files f ON f.id = e.src_file_id
              LEFT JOIN files tf ON tf.id = e.resolved_file_id
@@ -911,6 +1024,7 @@ impl Store {
                     _ => None,
                 },
                 reason: r.get(6)?,
+                external_crate: r.get(7)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -930,6 +1044,7 @@ fn row_to_call_ref(r: &rusqlite::Row<'_>) -> rusqlite::Result<CallRef> {
             _ => None,
         },
         reason: r.get(5)?,
+        external_crate: r.get(6)?,
     })
 }
 
@@ -1171,6 +1286,7 @@ mod tests {
                     tier: resolve::TIER_RESOLVED,
                     target: Some((b_id, 1)),
                     reason: None,
+                    external_crate: None,
                 },
             )])
             .unwrap();

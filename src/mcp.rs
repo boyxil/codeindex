@@ -35,6 +35,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "get_hierarchy",
     "trace_path",
     "profile",
+    "external_calls",
+    "skim_source",
     "blast_radius",
     "get_symbol",
     "stats",
@@ -264,12 +266,16 @@ impl McpServer {
                 let refs = store.callers(&name)?;
                 let mut text = format!("{} call site(s) of \"{name}\":\n", refs.len());
                 for r in &refs {
-                    match (&r.target, &r.reason) {
-                        (Some((f, l)), _) => text.push_str(&format!(
+                    match (&r.target, &r.external_crate, &r.reason) {
+                        (Some((f, l)), _, _) => text.push_str(&format!(
                             "  {}:{} ({} → {}:{})\n",
                             r.file, r.line, r.tier, f, l
                         )),
-                        (None, Some(reason)) => text.push_str(&format!(
+                        (None, Some(crate_name), _) => text.push_str(&format!(
+                            "  {}:{} (external: {})\n",
+                            r.file, r.line, crate_name
+                        )),
+                        (None, None, Some(reason)) => text.push_str(&format!(
                             "  {}:{} ({}, {})\n",
                             r.file, r.line, r.tier, reason
                         )),
@@ -284,6 +290,7 @@ impl McpServer {
                         "tier": r.tier,
                         "target": r.target.as_ref().map(|(f, l)| json!({"file": f, "line": l})),
                         "reason": r.reason,
+                        "external_crate": r.external_crate,
                     })).collect::<Vec<_>>(),
                 });
                 ToolOutput { text, structured }
@@ -473,6 +480,64 @@ impl McpServer {
                 });
                 ToolOutput { text, structured }
             }
+            "external_calls" => {
+                let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
+                let e = query::external_calls(&store, &name)?;
+                let mut text = format!("external crates used by {}:\n", e.name);
+                for (c, n) in &e.calls {
+                    text.push_str(&format!("  calls   {c} ({n})\n"));
+                }
+                for (c, n) in &e.imports {
+                    text.push_str(&format!("  imports {c} ({n})\n"));
+                }
+                if e.calls.is_empty() && e.imports.is_empty() {
+                    text.push_str("  none\n");
+                }
+                let structured = json!({
+                    "name": e.name,
+                    "calls": e.calls.iter().map(|(c, n)| json!({"crate": c, "count": n})).collect::<Vec<_>>(),
+                    "imports": e.imports.iter().map(|(c, n)| json!({"crate": c, "count": n})).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
+            }
+            "skim_source" => {
+                let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
+                let file = sarg("file");
+                let max_items = narg("max_items", 40);
+                match query::skim(&store, &name, file.as_deref(), max_items)? {
+                    Some(skim) => {
+                        let mut text = format!(
+                            "{} {} at {}:{}-{}\n  {}\n",
+                            skim.kind, skim.name, skim.file, skim.start, skim.end, skim.signature
+                        );
+                        for i in &skim.items {
+                            text.push_str(&format!(
+                                "  {:>7} {}:{}  {}\n",
+                                i.kind, i.name, i.line, i.signature
+                            ));
+                        }
+                        if skim.items.is_empty() {
+                            text.push_str("  (no nested items)\n");
+                        }
+                        let structured = json!({
+                            "name": skim.name,
+                            "kind": skim.kind,
+                            "file": skim.file,
+                            "start": skim.start,
+                            "end": skim.end,
+                            "signature": skim.signature,
+                            "items": skim.items.iter().map(|i| json!({
+                                "kind": i.kind, "name": i.name, "line": i.line, "signature": i.signature,
+                            })).collect::<Vec<_>>(),
+                        });
+                        ToolOutput { text, structured }
+                    }
+                    None => ToolOutput {
+                        text: format!("no symbol named \"{name}\"\n"),
+                        structured: json!({ "name": name, "found": false }),
+                    },
+                }
+            }
             "blast_radius" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let affected = query::blast_radius(&store, &name)?;
@@ -533,6 +598,7 @@ impl McpServer {
                     "unresolved": unresolved,
                     "edge_reasons": dict(&store.edge_reason_counts()?),
                     "embeddings": store.embedding_count()?,
+                    "external": store.external_edge_count()?,
                 });
                 value["refresh_on_call"] = json!(self.refresh);
                 if let Some(client) = &self.semantic {
@@ -848,6 +914,61 @@ fn tools() -> Value {
             })
         ),
         tool(
+            "external_calls",
+            "External crates a symbol leans on: calls into them from its body and imports in its file. Labelled by the resolver, not guessed.",
+            json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "calls": array_of(json!({
+                        "type": "object",
+                        "properties": { "crate": { "type": "string" }, "count": { "type": "integer" } },
+                        "required": ["crate", "count"]
+                    })),
+                    "imports": array_of(json!({
+                        "type": "object",
+                        "properties": { "crate": { "type": "string" }, "count": { "type": "integer" } },
+                        "required": ["crate", "count"]
+                    }))
+                },
+                "required": ["name", "calls", "imports"]
+            })
+        ),
+        tool(
+            "skim_source",
+            "A body's outline: the declaration plus the items nested inside it, so you can tell which lines are worth reading.",
+            json!({
+                "name": { "type": "string", "description": "Exact symbol name" },
+                "file": { "type": "string", "description": "Restrict to this file (exact or suffix)" },
+                "max_items": { "type": "integer", "minimum": 1, "description": "Max nested items (default 40)" }
+            }),
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "file": { "type": "string" },
+                    "start": { "type": "integer" },
+                    "end": { "type": "integer" },
+                    "signature": { "type": "string" },
+                    "items": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" },
+                            "name": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "signature": { "type": "string" }
+                        },
+                        "required": ["kind", "name", "line"]
+                    }))
+                },
+                "required": ["name"]
+            })
+        ),
+        tool(
             "blast_radius",
             "Everything that transitively calls this symbol through resolved edges — what a change here can reach.",
             json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
@@ -1031,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_exactly_the_twelve_tools() {
+    fn tools_list_exposes_exactly_the_fourteen_tools() {
         let (_d, server) = fixture();
         let resp = call(&server, 2, "tools/list", json!({}));
         let tools = resp["result"]["tools"].as_array().unwrap();

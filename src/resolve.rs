@@ -92,6 +92,10 @@ pub struct Resolution {
     pub tier: &'static str,
     pub target: Option<(i64, i64)>,
     pub reason: Option<&'static str>,
+    /// Root of an unresolved path that is not a local module — the crate
+    /// the call most likely lands in (`std` in `std::mem::drop`). A
+    /// label, not a resolution: the tier stays `unresolved`.
+    pub external_crate: Option<String>,
 }
 
 fn resolved(target: (i64, i64)) -> Resolution {
@@ -99,6 +103,7 @@ fn resolved(target: (i64, i64)) -> Resolution {
         tier: TIER_RESOLVED,
         target: Some(target),
         reason: None,
+        external_crate: None,
     }
 }
 
@@ -107,6 +112,7 @@ fn candidate(reason: &'static str) -> Resolution {
         tier: TIER_CANDIDATE,
         target: None,
         reason: Some(reason),
+        external_crate: None,
     }
 }
 
@@ -115,6 +121,16 @@ fn unresolved(reason: &'static str) -> Resolution {
         tier: TIER_UNRESOLVED,
         target: None,
         reason: Some(reason),
+        external_crate: None,
+    }
+}
+
+fn unresolved_external(reason: &'static str, crate_name: String) -> Resolution {
+    Resolution {
+        tier: TIER_UNRESOLVED,
+        target: None,
+        reason: Some(reason),
+        external_crate: Some(crate_name),
     }
 }
 
@@ -295,7 +311,7 @@ impl Resolver {
             return unresolved(R_NOT_IN_SCOPE);
         };
         let module = deepen(&ctx.module, &ctx.spans, edge.src_line);
-        match edge.call_kind.as_str() {
+        let resolution = match edge.call_kind.as_str() {
             "method" => self.resolve_method(&module, edge),
             // `self.foo()` has a known receiver: the enclosing impl's
             // type. Outside an impl the code does not compile, so the
@@ -312,7 +328,59 @@ impl Resolver {
                 None => self.resolve_plain(&module, &edge.callee),
             },
             _ => self.resolve_plain(&module, &edge.callee),
+        };
+        // A qualified path whose root is not local points outside the
+        // index: label the crate so callers can say "external" honestly.
+        if resolution.tier == TIER_UNRESOLVED
+            && resolution.external_crate.is_none()
+            && resolution.reason == Some(R_QUALIFIER)
+        {
+            if let Some(qualifier) = &edge.qualifier {
+                if let Some(root) = self.external_root(qualifier, &module) {
+                    return unresolved_external(R_QUALIFIER, root);
+                }
+            }
         }
+        resolution
+    }
+
+    /// First path segment of `path` if it names something outside this
+    /// crate: not `crate`/`self`/`super`, not a local module or item, not
+    /// a crate alias. Single-segment paths are left alone — `Vec::new()`
+    /// would otherwise be labelled with a "crate" called Vec.
+    fn external_root(&self, path: &str, module: &str) -> Option<String> {
+        let trimmed = path.strip_prefix("::").unwrap_or(path);
+        let first = trimmed.split("::").next()?;
+        if first.is_empty() || matches!(first, "crate" | "self" | "super") {
+            return None;
+        }
+        // Convention separates the two shapes: crates are snake_case,
+        // types are CamelCase. `serde_json::parse` names a crate;
+        // `Vec::new` / `Foo::bar` name a type we simply do not index.
+        if first.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return None;
+        }
+        if self.program.crate_aliases.contains_key(first) {
+            return None;
+        }
+        let root = ns_root(module);
+        if self.program.modules.contains(&format!("{root}::{first}")) {
+            return None;
+        }
+        if self.lookup_name(root, first).is_some() {
+            return None;
+        }
+        Some(first.to_string())
+    }
+
+    /// External crate behind one stored `use` declaration, if any.
+    pub fn external_import_crate(&self, file_id: i64, line: i64, path: &str) -> Option<String> {
+        let ctx = self.files.get(&file_id)?;
+        let module = deepen(&ctx.module, &ctx.spans, line);
+        if self.resolve_path_inner(path, &module, 0).is_some() {
+            return None;
+        }
+        self.external_root(path, &module)
     }
 
     /// `x.foo()`: the receiver's declared type (parameter or annotated
@@ -895,6 +963,21 @@ mod tests {
         let edge = at(&e, "b.rs", 3);
         assert_eq!(edge.tier, TIER_CANDIDATE);
         assert_eq!(edge.reason.as_deref(), Some(R_GLOB));
+    }
+
+    #[test]
+    fn unresolved_paths_carry_their_external_crate() {
+        let (_d, e) = run(&[(
+            "lib.rs",
+            "mod a;\nfn f() {\n    std::mem::drop(1);\n    crate::a::target();\n}\n",
+        )]);
+        let std_edge = at(&e, "lib.rs", 3);
+        assert_eq!(std_edge.tier, TIER_UNRESOLVED);
+        assert_eq!(std_edge.external_crate.as_deref(), Some("std"));
+        // A local path that simply does not exist is not "external".
+        let local = at(&e, "lib.rs", 4);
+        assert_eq!(local.tier, TIER_UNRESOLVED);
+        assert_eq!(local.external_crate, None);
     }
 
     #[test]

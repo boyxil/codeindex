@@ -147,6 +147,26 @@ enum Command {
         /// Target symbol name.
         to: String,
     },
+    /// External crates a symbol leans on: calls into them and imports.
+    External {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact symbol name.
+        name: String,
+    },
+    /// A symbol's outline: declaration plus the items inside its body.
+    Skim {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact symbol name.
+        name: String,
+        /// Restrict to this file (exact or suffix).
+        #[arg(long)]
+        file: Option<String>,
+        /// Maximum nested items.
+        #[arg(long, default_value_t = 40)]
+        max_items: usize,
+    },
     /// Everything about one symbol in one answer.
     Profile {
         /// Indexed repository root.
@@ -441,11 +461,14 @@ fn main() -> Result<()> {
                 || {
                     println!("{} call site(s) of \"{name}\":", refs.len());
                     for r in &refs {
-                        match (&r.target, &r.reason) {
-                            (Some((f, l)), _) => {
+                        match (&r.target, &r.external_crate, &r.reason) {
+                            (Some((f, l)), _, _) => {
                                 println!("  {}:{} ({}) → {}:{}", r.file, r.line, r.tier, f, l)
                             }
-                            (None, Some(reason)) => {
+                            (None, Some(crate_name), _) => {
+                                println!("  {}:{} (external: {})", r.file, r.line, crate_name)
+                            }
+                            (None, None, Some(reason)) => {
                                 println!("  {}:{} ({}, {})", r.file, r.line, r.tier, reason)
                             }
                             _ => println!("  {}:{} ({})", r.file, r.line, r.tier),
@@ -645,6 +668,72 @@ fn main() -> Result<()> {
                 },
             );
         }
+        Command::External { path, name } => {
+            let store = open(&path)?;
+            let e = query::external_calls(&store, &name)?;
+            emit(
+                json_mode,
+                json!({
+                    "name": e.name,
+                    "calls": e.calls.iter().map(|(c, n)| json!({"crate": c, "count": n})).collect::<Vec<_>>(),
+                    "imports": e.imports.iter().map(|(c, n)| json!({"crate": c, "count": n})).collect::<Vec<_>>(),
+                }),
+                || {
+                    println!("external crates used by {}:", e.name);
+                    for (c, n) in &e.calls {
+                        println!("  calls   {c} ({n})");
+                    }
+                    for (c, n) in &e.imports {
+                        println!("  imports {c} ({n})");
+                    }
+                    if e.calls.is_empty() && e.imports.is_empty() {
+                        println!("  none");
+                    }
+                },
+            );
+        }
+        Command::Skim {
+            path,
+            name,
+            file,
+            max_items,
+        } => {
+            let store = open(&path)?;
+            match query::skim(&store, &name, file.as_deref(), max_items)? {
+                Some(skim) => emit(
+                    json_mode,
+                    json!({
+                        "name": skim.name,
+                        "kind": skim.kind,
+                        "file": skim.file,
+                        "start": skim.start,
+                        "end": skim.end,
+                        "signature": skim.signature,
+                        "items": skim.items.iter().map(|i| json!({
+                            "kind": i.kind, "name": i.name, "line": i.line, "signature": i.signature,
+                        })).collect::<Vec<_>>(),
+                    }),
+                    || {
+                        println!(
+                            "{} {} at {}:{}-{}",
+                            skim.kind, skim.name, skim.file, skim.start, skim.end
+                        );
+                        println!("  {}", skim.signature);
+                        for i in &skim.items {
+                            println!("  {:>7} {}:{}  {}", i.kind, i.name, i.line, i.signature);
+                        }
+                        if skim.items.is_empty() {
+                            println!("  (no nested items)");
+                        }
+                    },
+                ),
+                None => emit(
+                    json_mode,
+                    json!({ "error": format!("no symbol named \"{name}\"") }),
+                    || println!("no symbol named \"{name}\""),
+                ),
+            }
+        }
         Command::Profile { path, name } => {
             let store = open(&path)?;
             let p = query::profile(&store, &path, &name)?;
@@ -712,6 +801,7 @@ fn main() -> Result<()> {
                     "unresolved": unresolved,
                     "edge_reasons": reasons,
                     "embeddings": store.embedding_count()?,
+                    "external": store.external_edge_count()?,
                     "schema_version": codeindex::store::SCHEMA_VERSION,
                     "extractor_version": codeindex::store::EXTRACTOR_VERSION,
                 }))?

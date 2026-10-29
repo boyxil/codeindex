@@ -119,6 +119,10 @@ health/историю/семантику, но не отвечает на стр
   `impls.trait_name` + `traits.supertraits` (схема v6, extractor v9).
   96 тестов.
 
+- **M12 (готово):** `external_crate` на рёбрах и импортах (схема v7,
+  extractor v10), метка `external` в `callers`, счётчик в `stats`;
+  тулы `external_calls` и `skim_source`. 100 тестов.
+
 ## Верификация (для каждой вехи)
 
 - Юнит-тесты на фикстурах (маленькие .rs-файлы с известным содержимым).

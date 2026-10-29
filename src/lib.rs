@@ -432,6 +432,13 @@ pub fn index(root: &Path) -> anyhow::Result<IndexStats> {
         updates.push((edge.id, resolver.resolve_edge(&edge)));
     }
     store.apply_resolutions(&updates)?;
+    // Which imports point outside the crate — decided here, where the
+    // resolver still holds the module tree, so queries need no resolver.
+    let mut import_updates = Vec::new();
+    for (id, file_id, line, path) in store.all_imports()? {
+        import_updates.push((id, resolver.external_import_crate(file_id, line, &path)));
+    }
+    store.apply_import_externals(&import_updates)?;
     let (resolved, candidate, unresolved) = store.edge_tier_counts()?;
     stats.edges = resolved + candidate + unresolved;
     stats.resolved = resolved;

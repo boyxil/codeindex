@@ -18,7 +18,7 @@ tree-sitter, stack-graphs и прочих парсинг-зависимосте�
 | M1 | SQLite-хранилище `.codeindex/index.db`, инкрементальная индексация по SHA-256 |
 | M2 | Места вызовов: прямые, методы, пути, турбофиш; запросы `search`/`definition`/`callers` |
 | M3 | Свой резолвер имён: модульное дерево, `use`-пути, ре-экспорты, impl-таблица, `Self::`, `self.method()`, `Trait::method`, варианты enum, типы получателей из параметров и `let`-аннотаций, кросс-крейтовый резолв; `call_tree`, `callee_tree`, `trace_path`, `blast_radius`, иерархия типов/трейтов |
-| M4 | MCP-сервер (stdio, JSON-RPC 2.0) с двенадцатью инструментами; ответы несут `structuredContent` + точные `outputSchema` |
+| M4 | MCP-сервер (stdio, JSON-RPC 2.0) с четырнадцатью инструментами; ответы несут `structuredContent` + точные `outputSchema` |
 | M5 | Семантический поиск на **отдельном** инстансе YantrikDB (не память агента); векторы — Ollama `bge-m3` (1024d), кэш в SQLite |
 
 ## Честность рёбер
@@ -32,6 +32,12 @@ tree-sitter, stack-graphs и прочих парсинг-зависимосте�
   (`method-call`, `glob-import`, `qualifier-not-found`,
   `not-found-in-scope`, `no-such-fn-in-impl`, `not-a-function`,
   `not-found-in-module`, `ambiguous`).
+
+Кроме того, у `unresolved`-рёбер, чей путь начинается не с локального
+модуля, записывается **внешний крейт** (`std` в `std::mem::drop`,
+`serde` в `use serde::Serialize`). Это метка, а не резолюция: tier
+остаётся `unresolved`, но в выводе такой вызов честно помечен
+`external: std` — «вне индекса», а не «не смогли разобрать».
 
 Ни один «кандидат» не выдаётся за факт — это принцип проекта, а не
 деталь реализации.
@@ -49,6 +55,8 @@ cargo build --release
 ./target/release/codeindex hierarchy . Store
 ./target/release/codeindex trace . main lex
 ./target/release/codeindex profile . lex
+./target/release/codeindex external . run_tool
+./target/release/codeindex skim . run_tool
 ./target/release/codeindex blast-radius . lex
 ./target/release/codeindex symbol . lex       # исходник символа
 ./target/release/codeindex references . lex
@@ -67,7 +75,8 @@ codeindex serve /path/to/repo --no-refresh  # не переиндексиров�
 
 Инструменты: `search_symbols` (в т.ч. `mode: "semantic"`), `get_definition`,
 `get_callers`, `get_references`, `get_symbol`, `call_tree`, `callee_tree`,
-`trace_path`, `get_hierarchy`, `profile`, `blast_radius`, `stats`.
+`trace_path`, `get_hierarchy`, `profile`, `external_calls`, `skim_source`,
+`blast_radius`, `stats`.
 
 zcode (`~/.zcode/cli/config.json`, ключ `servers`):
 

@@ -467,6 +467,113 @@ pub fn trace_path(store: &Store, from: &str, to: &str) -> Result<Option<Vec<Trac
     Ok(Some(steps))
 }
 
+/// External crates a symbol leans on: calls into them from its body and
+/// imports in its file. Both are labelled by the resolver, not guessed
+/// here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalUsage {
+    pub name: String,
+    /// (crate, call sites) inside the symbol's span.
+    pub calls: Vec<(String, usize)>,
+    /// (crate, import count) in the symbol's file.
+    pub imports: Vec<(String, usize)>,
+}
+
+pub fn external_calls(store: &Store, name: &str) -> Result<ExternalUsage> {
+    let defs = store.definitions(name)?;
+    let mut calls: Vec<(String, usize)> = Vec::new();
+    let mut imports: Vec<(String, usize)> = Vec::new();
+    let merge = |into: &mut Vec<(String, usize)>, key: String, count: usize| match into
+        .iter_mut()
+        .find(|(k, _)| *k == key)
+    {
+        Some((_, c)) => *c += count,
+        None => into.push((key, count)),
+    };
+    for def in &defs {
+        let end = store_symbol_end(store, &def.file, def.line);
+        for (crate_name, count) in store.external_calls_in_span(&def.file, def.line, end)? {
+            merge(&mut calls, crate_name, count);
+        }
+        for (crate_name, count) in store.external_imports_of(&def.file)? {
+            merge(&mut imports, crate_name, count);
+        }
+    }
+    calls.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    imports.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    Ok(ExternalUsage {
+        name: name.to_string(),
+        calls,
+        imports,
+    })
+}
+
+/// One item in a body outline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkimItem {
+    pub kind: String,
+    pub name: String,
+    pub line: i64,
+    pub signature: String,
+}
+
+/// A symbol's outline: its own declaration plus the items declared
+/// inside its body — enough to decide which lines are worth reading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Skim {
+    pub file: String,
+    pub kind: String,
+    pub name: String,
+    pub start: i64,
+    pub end: i64,
+    pub signature: String,
+    pub items: Vec<SkimItem>,
+}
+
+pub fn skim(
+    store: &Store,
+    name: &str,
+    file: Option<&str>,
+    max_items: usize,
+) -> Result<Option<Skim>> {
+    let defs = store.definitions(name)?;
+    let Some(def) = defs
+        .into_iter()
+        .find(|d| file.is_none_or(|f| d.file == f || d.file.ends_with(f)))
+    else {
+        return Ok(None);
+    };
+    let end = store_symbol_end(store, &def.file, def.line);
+    let signature = store
+        .signature_at(&def.file, def.line, &def.name)?
+        .unwrap_or_default();
+    let items = store
+        .symbols_in_span(&def.file, def.line, end)?
+        .into_iter()
+        .filter(|s| !(s.line == def.line && s.name == def.name))
+        .take(max_items)
+        .map(|s| SkimItem {
+            signature: store
+                .signature_at(&s.file, s.line, &s.name)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            kind: s.kind,
+            name: s.name,
+            line: s.line,
+        })
+        .collect();
+    Ok(Some(Skim {
+        file: def.file,
+        kind: def.kind,
+        name: def.name,
+        start: def.line,
+        end,
+        signature,
+        items,
+    }))
+}
+
 /// Everything about one symbol in a single answer: definitions, caller
 /// tiers, resolved callees, lexical references and hierarchy.
 #[derive(Debug, Clone, PartialEq)]
@@ -730,6 +837,51 @@ mod tests {
         // Depth limit stops expansion.
         let shallow = call_tree(&store, "leaf", 1).unwrap();
         assert!(shallow[0].children[0].children.is_empty());
+    }
+
+    #[test]
+    fn external_calls_reports_crates_and_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "use serde::Serialize;\nfn f() {\n    std::mem::drop(1);\n    local_missing();\n}\n",
+        )
+        .unwrap();
+        crate::index(dir.path()).unwrap();
+        let store = Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        let usage = external_calls(&store, "f").unwrap();
+        assert!(
+            usage.calls.iter().any(|(c, _)| c == "std"),
+            "{:?}",
+            usage.calls
+        );
+        assert!(
+            usage.imports.iter().any(|(c, _)| c == "serde"),
+            "{:?}",
+            usage.imports
+        );
+        // A plain unresolved call is not an external crate.
+        assert!(!usage.calls.iter().any(|(c, _)| c == "local_missing"));
+    }
+
+    #[test]
+    fn skim_lists_nested_items() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "fn outer() {\n    fn helper() {}\n    struct Inner;\n    let x = 1;\n}\n",
+        )
+        .unwrap();
+        crate::index(dir.path()).unwrap();
+        let store = Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        let skimmed = skim(&store, "outer", None, 10).unwrap().unwrap();
+        let names: Vec<(&str, &str)> = skimmed
+            .items
+            .iter()
+            .map(|i| (i.name.as_str(), i.kind.as_str()))
+            .collect();
+        assert_eq!(names, vec![("helper", "fn"), ("Inner", "struct")]);
+        assert!(skimmed.signature.contains("fn outer()"));
     }
 
     #[test]
