@@ -185,6 +185,32 @@ enum Command {
         /// Exact symbol name.
         name: String,
     },
+    /// Directory map: files with their symbol counts.
+    Files {
+        /// Indexed repository root.
+        path: PathBuf,
+    },
+    /// External crates the repo leans on, ranked by usage.
+    Dependencies {
+        /// Indexed repository root.
+        path: PathBuf,
+    },
+    /// Unresolved calls with their reasons (the honesty ledger).
+    Unresolved {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Scope to one file.
+        #[arg(long)]
+        file: Option<String>,
+        /// Maximum rows.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Files the index does not cover, with reasons.
+    Unlisted {
+        /// Repository root (fresh walk, no index needed).
+        path: PathBuf,
+    },
     /// Index statistics: files, symbols by kind, edges by tier and reason.
     Stats {
         /// Indexed repository root.
@@ -833,6 +859,84 @@ fn main() -> Result<()> {
                     if !p.hierarchy.implementors.is_empty() {
                         println!("  implemented by: {}", p.hierarchy.implementors.join(", "));
                     }
+                },
+            );
+        }
+        Command::Files { path } => {
+            let store = open(&path)?;
+            let files = query::list_files(&store)?;
+            emit(
+                json_mode,
+                json!({
+                    "files": files.iter().map(|f| json!({
+                        "path": f.path, "symbols": f.symbols, "lines": f.lines,
+                    })).collect::<Vec<_>>(),
+                }),
+                || {
+                    for f in &files {
+                        println!(
+                            "  {:>4} symbols {:>5} lines  {}",
+                            f.symbols, f.lines, f.path
+                        );
+                    }
+                    println!("{} file(s)", files.len());
+                },
+            );
+        }
+        Command::Dependencies { path } => {
+            let store = open(&path)?;
+            let deps = query::list_dependencies(&store)?;
+            emit(
+                json_mode,
+                json!({
+                    "dependencies": deps.iter().map(|d| json!({
+                        "crate": d.crate_name, "calls": d.calls, "imports": d.imports,
+                    })).collect::<Vec<_>>(),
+                }),
+                || {
+                    println!("external crates ({}):", deps.len());
+                    for d in &deps {
+                        println!(
+                            "  {:20} calls:{} imports:{}",
+                            d.crate_name, d.calls, d.imports
+                        );
+                    }
+                },
+            );
+        }
+        Command::Unresolved { path, file, limit } => {
+            let store = open(&path)?;
+            let rows = query::list_unresolved(&store, file.as_deref(), limit)?;
+            emit(
+                json_mode,
+                json!({
+                    "rows": rows.iter().map(|r| json!({
+                        "file": r.file, "line": r.line, "callee": r.callee,
+                        "reason": r.reason, "external_crate": r.external_crate,
+                    })).collect::<Vec<_>>(),
+                }),
+                || {
+                    println!("{} unresolved call(s):", rows.len());
+                    for r in &rows {
+                        println!("  {}:{} {} — {}", r.file, r.line, r.callee, r.reason);
+                    }
+                },
+            );
+        }
+        Command::Unlisted { path } => {
+            let unlisted = codeindex::unlisted_files(&path);
+            emit(
+                json_mode,
+                json!({
+                    "unlisted": unlisted.iter().map(|u| json!({
+                        "path": u.path.display().to_string(), "reason": u.reason,
+                    })).collect::<Vec<_>>(),
+                }),
+                || {
+                    for u in &unlisted {
+                        println!("  {} — {}", u.path.display(), u.reason);
+                    }
+                    println!("{} entrie(s) outside the index", unlisted.len());
                 },
             );
         }

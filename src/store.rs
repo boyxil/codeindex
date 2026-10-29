@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: &str = "7";
 /// scopes since M3). Unlike schema_version this describes the *derived*
 /// data: bumping it makes stored hashes stale as parse decisions, so the
 /// next index run re-parses everything once.
-pub const EXTRACTOR_VERSION: &str = "10";
+pub const EXTRACTOR_VERSION: &str = "12";
 
 /// One indexed symbol joined with its file — the read API M2 queries
 /// grow from.
@@ -70,6 +70,15 @@ pub struct SemanticRow {
     pub name: String,
     pub line: i64,
     pub signature: String,
+}
+
+/// One row of the honesty ledger: an unresolved call and why.
+pub struct UnresolvedRow {
+    pub file: String,
+    pub line: i64,
+    pub callee: String,
+    pub reason: String,
+    pub external_crate: Option<String>,
 }
 
 pub struct Store {
@@ -732,6 +741,103 @@ impl Store {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// Per-file map: path, symbol count, and the deepest line reached by
+    /// an indexed symbol.
+    pub fn files_overview(&self) -> Result<Vec<(String, usize, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, COUNT(s.id), COALESCE(MAX(s.end_line), 0)
+             FROM files f LEFT JOIN symbols s ON s.file_id = f.id
+             GROUP BY f.path ORDER BY f.path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as usize,
+                r.get(2)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// External crates by usage: (crate, call edges, imports).
+    pub fn dependency_counts(&self) -> Result<Vec<(String, usize, usize)>> {
+        let mut edges: HashMap<String, usize> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT external_crate, COUNT(*) FROM edges
+                 WHERE external_crate IS NOT NULL GROUP BY external_crate",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            for row in rows {
+                let (k, n) = row?;
+                *edges.entry(k).or_default() += n;
+            }
+        }
+        let mut imports: HashMap<String, usize> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT external_crate, COUNT(*) FROM imports
+                 WHERE external_crate IS NOT NULL GROUP BY external_crate",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            for row in rows {
+                let (k, n) = row?;
+                *imports.entry(k).or_default() += n;
+            }
+        }
+        let mut crates: Vec<String> = edges.keys().chain(imports.keys()).cloned().collect();
+        crates.sort();
+        crates.dedup();
+        Ok(crates
+            .into_iter()
+            .map(|c| {
+                (
+                    c.clone(),
+                    edges.get(&c).copied().unwrap_or(0),
+                    imports.get(&c).copied().unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
+    /// Unresolved calls with their reasons — the honesty ledger, one row
+    /// per call. Optionally scoped to a file.
+    pub fn unresolved_calls(&self, file: Option<&str>, limit: usize) -> Result<Vec<UnresolvedRow>> {
+        let sql = format!(
+            "SELECT f.path, e.src_line, e.callee, e.reason, e.external_crate
+             FROM edges e JOIN files f ON f.id = e.src_file_id
+             WHERE e.tier = 'unresolved' {} LIMIT {limit}",
+            if file.is_some() {
+                "AND f.path = ?1"
+            } else {
+                ""
+            },
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<UnresolvedRow> {
+            Ok(UnresolvedRow {
+                file: r.get(0)?,
+                line: r.get(1)?,
+                callee: r.get(2)?,
+                reason: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                external_crate: r.get(4)?,
+            })
+        };
+        let rows = if let Some(f) = file {
+            stmt.query_map(params![f], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        Ok(rows)
     }
 
     /// Every symbol with its declaration text — input for the semantic

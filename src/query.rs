@@ -786,6 +786,74 @@ fn arg_text(src: &str, tokens: &[crate::lexer::Token], from: usize, to: usize) -
     }
 }
 
+/// Per-file overview for the directory map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileOverview {
+    pub path: String,
+    pub symbols: usize,
+    pub lines: i64,
+}
+
+pub fn list_files(store: &Store) -> Result<Vec<FileOverview>> {
+    Ok(store
+        .files_overview()?
+        .into_iter()
+        .map(|(path, symbols, lines)| FileOverview {
+            path,
+            symbols,
+            lines,
+        })
+        .collect())
+}
+
+/// One external crate with its usage counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dependency {
+    pub crate_name: String,
+    pub calls: usize,
+    pub imports: usize,
+}
+
+pub fn list_dependencies(store: &Store) -> Result<Vec<Dependency>> {
+    Ok(store
+        .dependency_counts()?
+        .into_iter()
+        .map(|(crate_name, calls, imports)| Dependency {
+            crate_name,
+            calls,
+            imports,
+        })
+        .collect())
+}
+
+/// One unresolved call with its reason — the honesty ledger, row by row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedCall {
+    pub file: String,
+    pub line: i64,
+    pub callee: String,
+    pub reason: String,
+    pub external_crate: Option<String>,
+}
+
+pub fn list_unresolved(
+    store: &Store,
+    file: Option<&str>,
+    limit: usize,
+) -> Result<Vec<UnresolvedCall>> {
+    Ok(store
+        .unresolved_calls(file, limit)?
+        .into_iter()
+        .map(|row| UnresolvedCall {
+            file: row.file,
+            line: row.line,
+            callee: row.callee,
+            reason: row.reason,
+            external_crate: row.external_crate,
+        })
+        .collect())
+}
+
 /// Everything about one symbol in a single answer: definitions, caller
 /// tiers, resolved callees, lexical references and hierarchy.
 #[derive(Debug, Clone, PartialEq)]
@@ -1161,6 +1229,33 @@ mod tests {
         assert_eq!(p.references.0, 2); // definition + call
         assert_eq!(p.references.1.get("definition"), Some(&1));
         assert_eq!(p.references.1.get("call"), Some(&1));
+    }
+
+    #[test]
+    fn inventory_tools_cover_files_deps_and_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "fn f() {\n    std::mem::drop(1);\n}\n",
+        )
+        .unwrap();
+        crate::index(dir.path()).unwrap();
+        let store = Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+
+        let files = list_files(&store).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].symbols, 1);
+
+        let deps = list_dependencies(&store).unwrap();
+        assert!(
+            deps.iter().any(|d| d.crate_name == "std" && d.calls >= 1),
+            "{deps:?}"
+        );
+
+        let unresolved = list_unresolved(&store, None, 50).unwrap();
+        assert!(unresolved
+            .iter()
+            .any(|u| u.callee == "drop" && u.external_crate.as_deref() == Some("std")));
     }
 
     #[test]

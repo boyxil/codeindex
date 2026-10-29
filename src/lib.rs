@@ -209,6 +209,13 @@ pub fn extract_calls(tokens: &[lexer::Token], src: &str) -> Vec<CallSite> {
             i += 1;
             continue;
         }
+        // `#[derive(...)]` and friends put ident-call shapes inside
+        // attribute brackets; the ident right after `[` is a macro, not a
+        // call site.
+        if i > 0 && is_punct(src, &tokens[i - 1], "[") {
+            i += 1;
+            continue;
+        }
         // Classify by what precedes the name: `.` = method call,
         // `::` = qualified path call, anything else = plain call.
         let (kind, qualifier) = if i > 1
@@ -594,6 +601,69 @@ fn body_span(tokens: &[lexer::Token], src: &str, from: usize) -> Option<(usize, 
         j += 1;
     }
     None
+}
+
+/// A file or directory the index does not cover, with the reason.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unlisted {
+    pub path: PathBuf,
+    pub reason: &'static str,
+}
+
+/// Walk the tree and collect everything the index does NOT cover, so an
+/// agent can ask "what is missing from the map and why". Excluded
+/// directories (target, .git, .codeindex) are aggregated by design —
+/// listing their contents would be noise.
+pub fn unlisted_files(root: &Path) -> Vec<Unlisted> {
+    let mut out = Vec::new();
+    let mut excluded: Vec<PathBuf> = Vec::new();
+    walk_unlisted(root, &mut out, &mut excluded);
+    for dir in excluded {
+        out.push(Unlisted {
+            path: dir,
+            reason: "excluded by design",
+        });
+    }
+    out
+}
+
+fn walk_unlisted(dir: &Path, out: &mut Vec<Unlisted>, excluded: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() && path.is_dir() {
+            out.push(Unlisted {
+                path: path.clone(),
+                reason: "symlinked directory (not followed)",
+            });
+            continue;
+        }
+        if path.is_dir() {
+            if matches!(name, "target" | ".git" | ".codeindex") {
+                excluded.push(path);
+            } else {
+                walk_unlisted(&path, out, excluded);
+            }
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            if std::fs::read(&path).is_err() {
+                out.push(Unlisted {
+                    path,
+                    reason: "unreadable",
+                });
+            }
+        } else {
+            out.push(Unlisted {
+                path,
+                reason: "not Rust (Rust-only index)",
+            });
+        }
+    }
 }
 
 /// Collect *.rs files without following skipped directories.

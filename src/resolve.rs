@@ -376,7 +376,29 @@ impl Resolver {
         // Convention separates the two shapes: crates are snake_case,
         // types are CamelCase. `serde_json::parse` names a crate;
         // `Vec::new` / `Foo::bar` name a type we simply do not index.
-        if first.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        // Primitives (`f32`, `usize`, …) are types too.
+        if first.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            || matches!(
+                first,
+                "f32"
+                    | "f64"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "usize"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "isize"
+                    | "bool"
+                    | "char"
+                    | "str"
+            )
+        {
             return None;
         }
         if self.program.crate_aliases.contains_key(first) {

@@ -38,6 +38,10 @@ pub const TOOL_NAMES: &[&str] = &[
     "external_calls",
     "skim_source",
     "argument_provenance",
+    "list_files",
+    "list_dependencies",
+    "list_unresolved_calls",
+    "list_unlisted_files",
     "blast_radius",
     "get_symbol",
     "stats",
@@ -580,6 +584,69 @@ impl McpServer {
                     },
                 }
             }
+            "list_files" => {
+                let files = query::list_files(&store)?;
+                let mut text = format!("{} indexed file(s):\n", files.len());
+                for f in &files {
+                    text.push_str(&format!(
+                        "  {:>4} symbols {:>5} lines  {}\n",
+                        f.symbols, f.lines, f.path
+                    ));
+                }
+                let structured = json!({
+                    "files": files.iter().map(|f| json!({
+                        "path": f.path, "symbols": f.symbols, "lines": f.lines,
+                    })).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
+            }
+            "list_dependencies" => {
+                let deps = query::list_dependencies(&store)?;
+                let mut text = format!("external crates ({}):\n", deps.len());
+                for d in &deps {
+                    text.push_str(&format!(
+                        "  {:20} calls:{} imports:{}\n",
+                        d.crate_name, d.calls, d.imports
+                    ));
+                }
+                let structured = json!({
+                    "dependencies": deps.iter().map(|d| json!({
+                        "crate": d.crate_name, "calls": d.calls, "imports": d.imports,
+                    })).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
+            }
+            "list_unresolved_calls" => {
+                let file = sarg("file");
+                let limit = narg("limit", 50);
+                let rows = store.unresolved_calls(file.as_deref(), limit)?;
+                let mut text = format!("{} unresolved call(s):\n", rows.len());
+                for r in &rows {
+                    text.push_str(&format!(
+                        "  {}:{} {} — {}\n",
+                        r.file, r.line, r.callee, r.reason
+                    ));
+                }
+                let structured = json!({
+                    "rows": rows.iter().map(|r| json!({
+                        "file": r.file, "line": r.line, "callee": r.callee, "reason": r.reason,
+                    })).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
+            }
+            "list_unlisted_files" => {
+                let unlisted = crate::unlisted_files(&self.root);
+                let mut text = format!("{} entrie(s) outside the index:\n", unlisted.len());
+                for u in &unlisted {
+                    text.push_str(&format!("  {} — {}\n", u.path.display(), u.reason));
+                }
+                let structured = json!({
+                    "unlisted": unlisted.iter().map(|u| json!({
+                        "path": u.path.display().to_string(), "reason": u.reason,
+                    })).collect::<Vec<_>>(),
+                });
+                ToolOutput { text, structured }
+            }
             "blast_radius" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let affected = query::blast_radius(&store, &name)?;
@@ -1038,6 +1105,93 @@ fn tools() -> Value {
             })
         ),
         tool(
+            "list_files",
+            "Directory map: every indexed file with its symbol count and the deepest indexed line.",
+            json!({}),
+            json!([]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "files": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "symbols": { "type": "integer" },
+                            "lines": { "type": "integer" }
+                        },
+                        "required": ["path", "symbols", "lines"]
+                    }))
+                },
+                "required": ["files"]
+            })
+        ),
+        tool(
+            "list_dependencies",
+            "External crates the repository leans on, ranked by usage (call edges and imports).",
+            json!({}),
+            json!([]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "dependencies": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "crate": { "type": "string" },
+                            "calls": { "type": "integer" },
+                            "imports": { "type": "integer" }
+                        },
+                        "required": ["crate", "calls", "imports"]
+                    }))
+                },
+                "required": ["dependencies"]
+            })
+        ),
+        tool(
+            "list_unresolved_calls",
+            "Calls the resolver could not settle, each with its reason — nothing is silently guessed.",
+            json!({
+                "file": { "type": "string", "description": "Scope to one file" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Max rows (default 50)" }
+            }),
+            json!([]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "rows": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "file": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "callee": { "type": "string" },
+                            "reason": { "type": "string" }
+                        },
+                        "required": ["file", "line", "callee", "reason"]
+                    }))
+                },
+                "required": ["rows"]
+            })
+        ),
+        tool(
+            "list_unlisted_files",
+            "Files and directories the index does not cover, each with the reason (non-Rust, symlink, excluded).",
+            json!({}),
+            json!([]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "unlisted": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "reason": { "type": "string" }
+                        },
+                        "required": ["path", "reason"]
+                    }))
+                },
+                "required": ["unlisted"]
+            })
+        ),
+        tool(
             "blast_radius",
             "Everything that transitively calls this symbol through resolved edges — what a change here can reach.",
             json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
@@ -1221,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_exactly_the_fifteen_tools() {
+    fn tools_list_exposes_exactly_the_nineteen_tools() {
         let (_d, server) = fixture();
         let resp = call(&server, 2, "tools/list", json!({}));
         let tools = resp["result"]["tools"].as_array().unwrap();
@@ -1286,6 +1440,20 @@ mod tests {
         assert!(text.contains("lib.rs:3"), "{text}");
         let text = tool_text(&server, "blast_radius", json!({ "name": "helper" }));
         assert!(text.contains("d1 lib.rs:3"), "{text}");
+    }
+
+    #[test]
+    fn inventory_tools_answer() {
+        let (_d, server) = fixture();
+        for (tool, args, needle) in [
+            ("list_files", json!({}), "lib.rs"),
+            ("list_dependencies", json!({}), "external crates"),
+            ("list_unresolved_calls", json!({}), "unresolved call"),
+            ("list_unlisted_files", json!({}), "outside the index"),
+        ] {
+            let text = tool_text(&server, tool, args);
+            assert!(text.contains(needle), "{tool}: {text}");
+        }
     }
 
     #[test]
