@@ -574,6 +574,218 @@ pub fn skim(
     }))
 }
 
+/// One call site with the raw text of the arguments it passes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallArgs {
+    pub file: String,
+    pub line: i64,
+    pub tier: String,
+    pub args: Vec<String>,
+}
+
+/// Lexical argument provenance: a function's parameters and, for every
+/// call site that reaches it, the source text of what is passed. This is
+/// what the code *says*, not what the values *are* — no data-flow
+/// analysis, and it is labelled accordingly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Provenance {
+    pub name: String,
+    pub params: Vec<String>,
+    pub call_sites: Vec<CallArgs>,
+}
+
+/// Parameter names of a fn declaration, read from the tokens. `::` in a
+/// type path is two colons, so a name is an ident followed by exactly
+/// one colon; `&self` has no colon and is skipped.
+fn fn_params(tokens: &[crate::lexer::Token], src: &str, name_idx: usize) -> Vec<String> {
+    let colon_after = |j: usize| -> bool {
+        tokens.get(j + 1).is_some_and(|t| {
+            t.kind == crate::lexer::Tok::Punct && crate::lexer::text(src, t) == ":"
+        }) && !tokens.get(j + 2).is_some_and(|t| {
+            t.kind == crate::lexer::Tok::Punct && crate::lexer::text(src, t) == ":"
+        })
+    };
+    let mut angle = 0i32;
+    let mut j = name_idx + 1;
+    let mut open = None;
+    while j < tokens.len() {
+        let t = &tokens[j];
+        if t.kind == crate::lexer::Tok::Punct {
+            match crate::lexer::text(src, t) {
+                "<" => angle += 1,
+                ">" => angle = (angle - 1).max(0),
+                "(" if angle == 0 => {
+                    open = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    let Some(open) = open else {
+        return Vec::new();
+    };
+    let Some(close) = crate::scopes::matching_paren(tokens, src, open) else {
+        return Vec::new();
+    };
+    let mut params = Vec::new();
+    let mut depth = 0i32;
+    let mut k = open + 1;
+    while k < close {
+        let t = &tokens[k];
+        if t.kind == crate::lexer::Tok::Punct {
+            match crate::lexer::text(src, t) {
+                "(" | "<" | "[" => depth += 1,
+                ")" | ">" | "]" => depth = (depth - 1).max(0),
+                _ => {}
+            }
+        } else if t.kind == crate::lexer::Tok::Ident && depth == 0 && colon_after(k) {
+            params.push(crate::lexer::text(src, t).to_string());
+        }
+        k += 1;
+    }
+    params
+}
+
+pub fn argument_provenance(
+    store: &Store,
+    root: &std::path::Path,
+    name: &str,
+    max_sites: usize,
+) -> Result<Option<Provenance>> {
+    let _ = root;
+    let defs = store.definitions(name)?;
+    let Some(def) = defs.iter().find(|d| d.kind == "fn") else {
+        return Ok(None);
+    };
+    let src = std::fs::read_to_string(root.join(&def.file))?;
+    let tokens = crate::lexer::lex(&src);
+    // The declaration: Ident(name) right after Ident("fn").
+    let mut name_idx = None;
+    for i in 1..tokens.len() {
+        if tokens[i].kind == crate::lexer::Tok::Ident
+            && crate::lexer::text(&src, &tokens[i]) == name
+            && tokens[i - 1].kind == crate::lexer::Tok::Ident
+            && crate::lexer::text(&src, &tokens[i - 1]) == "fn"
+        {
+            name_idx = Some(i);
+            break;
+        }
+    }
+    let params = name_idx
+        .map(|i| fn_params(&tokens, &src, i))
+        .unwrap_or_default();
+
+    // Call sites whose resolved target is this definition.
+    let mut call_sites = Vec::new();
+    let mut sources: HashMap<String, (Vec<crate::lexer::Token>, String)> = HashMap::new();
+    for r in store.callers(name)? {
+        let Some((tf, tl)) = &r.target else {
+            continue;
+        };
+        if tf != &def.file || tl != &def.line {
+            continue;
+        }
+        if call_sites.len() >= max_sites {
+            break;
+        }
+        let (tokens, src) = sources.entry(r.file.clone()).or_insert_with(|| {
+            let src = std::fs::read_to_string(root.join(&r.file)).unwrap_or_default();
+            (crate::lexer::lex(&src), src)
+        });
+        let args = call_args_at(tokens, src, name, r.line);
+        call_sites.push(CallArgs {
+            file: r.file.clone(),
+            line: r.line,
+            tier: r.tier,
+            args,
+        });
+    }
+    Ok(Some(Provenance {
+        name: name.to_string(),
+        params,
+        call_sites,
+    }))
+}
+
+/// Raw text of the arguments at the call site of `callee` on `line`.
+fn call_args_at(tokens: &[crate::lexer::Token], src: &str, callee: &str, line: i64) -> Vec<String> {
+    let is = |t: &crate::lexer::Token, w: &str| {
+        t.kind == crate::lexer::Tok::Ident && crate::lexer::text(src, t) == w
+    };
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i].line as i64 > line {
+            break; // past the call site
+        }
+        // The edge records the callee token's line: match exactly there,
+        // so an earlier same-name call does not shadow this one.
+        if tokens[i].line as i64 == line
+            && is(&tokens[i], callee)
+            && (i == 0 || !is(&tokens[i.saturating_sub(1)], "fn"))
+        {
+            // First "(" within a small window (turbofish is a few tokens).
+            let mut j = i + 1;
+            let mut seen = 0usize;
+            while j < tokens.len() && seen < 12 {
+                if tokens[j].kind == crate::lexer::Tok::Punct
+                    && crate::lexer::text(src, &tokens[j]) == "("
+                {
+                    break;
+                }
+                j += 1;
+                seen += 1;
+            }
+            if let Some(close) = j
+                .checked_add(1)
+                .and_then(|k| tokens.get(k).map(|_| ()))
+                .and_then(|_| crate::scopes::matching_paren(tokens, src, j))
+            {
+                // Split the inside by commas at depth 0.
+                let mut args = Vec::new();
+                let (mut depth, mut seg_start) = (0i32, j + 1);
+                let mut k = j + 1;
+                while k < close {
+                    let t = &tokens[k];
+                    if t.kind == crate::lexer::Tok::Punct {
+                        match crate::lexer::text(src, t) {
+                            "(" | "[" | "{" | "<" => depth += 1,
+                            ")" | "]" | "}" => depth = (depth - 1).max(0),
+                            ">" => depth = (depth - 1).max(0),
+                            "," if depth == 0 => {
+                                args.push(arg_text(src, tokens, seg_start, k));
+                                seg_start = k + 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    k += 1;
+                }
+                args.push(arg_text(src, tokens, seg_start, close));
+                return args;
+            }
+        }
+        i += 1;
+    }
+    Vec::new()
+}
+
+fn arg_text(src: &str, tokens: &[crate::lexer::Token], from: usize, to: usize) -> String {
+    let first = tokens.get(from);
+    let last = tokens.get(to.saturating_sub(1));
+    let (Some(first), Some(last)) = (first, last) else {
+        return String::new();
+    };
+    let text = &src[first.start..last.end];
+    let trimmed = text.trim();
+    if trimmed.chars().count() > 80 {
+        format!("{}…", trimmed.chars().take(79).collect::<String>())
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Everything about one symbol in a single answer: definitions, caller
 /// tiers, resolved callees, lexical references and hierarchy.
 #[derive(Debug, Clone, PartialEq)]
@@ -882,6 +1094,30 @@ mod tests {
             .collect();
         assert_eq!(names, vec![("helper", "fn"), ("Inner", "struct")]);
         assert!(skimmed.signature.contains("fn outer()"));
+    }
+
+    #[test]
+    fn provenance_lists_params_and_raw_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "fn target(count: u8, label: &str) {}\nfn caller() {\n    target(3 + 1, \"hi\");\n    target(\n        7,\n        \"multi\"\n    );\n}\n",
+        )
+        .unwrap();
+        crate::index(dir.path()).unwrap();
+        let store = Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
+        let p = argument_provenance(&store, dir.path(), "target", 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.params, vec!["count", "label"]);
+        assert_eq!(p.call_sites.len(), 2);
+        assert_eq!(p.call_sites[0].tier, "resolved");
+        assert_eq!(p.call_sites[0].args, vec!["3 + 1", "\"hi\""]);
+        assert_eq!(
+            p.call_sites[1].args,
+            vec!["7", "\"multi\""],
+            "multi-line call must still split cleanly"
+        );
     }
 
     #[test]

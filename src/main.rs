@@ -167,6 +167,17 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         max_items: usize,
     },
+    /// Parameters of a symbol and the raw arguments passed at every
+    /// call site (lexical, no data-flow analysis).
+    Provenance {
+        /// Indexed repository root.
+        path: PathBuf,
+        /// Exact symbol name.
+        name: String,
+        /// Maximum call sites.
+        #[arg(long, default_value_t = 20)]
+        max_sites: usize,
+    },
     /// Everything about one symbol in one answer.
     Profile {
         /// Indexed repository root.
@@ -731,6 +742,53 @@ fn main() -> Result<()> {
                     json_mode,
                     json!({ "error": format!("no symbol named \"{name}\"") }),
                     || println!("no symbol named \"{name}\""),
+                ),
+            }
+        }
+        Command::Provenance {
+            path,
+            name,
+            max_sites,
+        } => {
+            let store = open(&path)?;
+            match query::argument_provenance(&store, &path, &name, max_sites)? {
+                Some(p) => emit(
+                    json_mode,
+                    json!({
+                        "name": p.name,
+                        "params": p.params,
+                        "call_sites": p.call_sites.iter().map(|c| json!({
+                            "file": c.file, "line": c.line, "tier": c.tier, "args": c.args,
+                        })).collect::<Vec<_>>(),
+                    }),
+                    || {
+                        println!(
+                            "{} (params: {})",
+                            p.name,
+                            if p.params.is_empty() {
+                                "—".to_string()
+                            } else {
+                                p.params.join(", ")
+                            }
+                        );
+                        for c in &p.call_sites {
+                            println!(
+                                "  {}:{} ({}) args: [{}]",
+                                c.file,
+                                c.line,
+                                c.tier,
+                                c.args.join(", ")
+                            );
+                        }
+                        if p.call_sites.is_empty() {
+                            println!("  no resolved call sites");
+                        }
+                    },
+                ),
+                None => emit(
+                    json_mode,
+                    json!({ "error": format!("no fn named \"{name}\"") }),
+                    || println!("no fn named \"{name}\""),
                 ),
             }
         }

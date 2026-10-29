@@ -18,7 +18,7 @@ tree-sitter, stack-graphs и прочих парсинг-зависимосте�
 | M1 | SQLite-хранилище `.codeindex/index.db`, инкрементальная индексация по SHA-256 |
 | M2 | Места вызовов: прямые, методы, пути, турбофиш; запросы `search`/`definition`/`callers` |
 | M3 | Свой резолвер имён: модульное дерево, `use`-пути, ре-экспорты, impl-таблица, `Self::`, `self.method()`, `Trait::method`, варианты enum, типы получателей из параметров и `let`-аннотаций, кросс-крейтовый резолв; `call_tree`, `callee_tree`, `trace_path`, `blast_radius`, иерархия типов/трейтов |
-| M4 | MCP-сервер (stdio, JSON-RPC 2.0) с четырнадцатью инструментами; ответы несут `structuredContent` + точные `outputSchema` |
+| M4 | MCP-сервер (stdio, JSON-RPC 2.0) с пятнадцатью инструментами; ответы несут `structuredContent` + точные `outputSchema` |
 | M5 | Семантический поиск на **отдельном** инстансе YantrikDB (не память агента); векторы — Ollama `bge-m3` (1024d), кэш в SQLite |
 
 ## Честность рёбер
@@ -76,7 +76,7 @@ codeindex serve /path/to/repo --no-refresh  # не переиндексиров�
 Инструменты: `search_symbols` (в т.ч. `mode: "semantic"`), `get_definition`,
 `get_callers`, `get_references`, `get_symbol`, `call_tree`, `callee_tree`,
 `trace_path`, `get_hierarchy`, `profile`, `external_calls`, `skim_source`,
-`blast_radius`, `stats`.
+`argument_provenance`, `blast_radius`, `stats`.
 
 zcode (`~/.zcode/cli/config.json`, ключ `servers`):
 

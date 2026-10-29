@@ -37,6 +37,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "profile",
     "external_calls",
     "skim_source",
+    "argument_provenance",
     "blast_radius",
     "get_symbol",
     "stats",
@@ -538,6 +539,47 @@ impl McpServer {
                     },
                 }
             }
+            "argument_provenance" => {
+                let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
+                let max_sites = narg("max_sites", 20);
+                match query::argument_provenance(&store, &self.root, &name, max_sites)? {
+                    Some(p) => {
+                        let mut text = format!(
+                            "{} (params: {})\n",
+                            p.name,
+                            if p.params.is_empty() {
+                                "—".to_string()
+                            } else {
+                                p.params.join(", ")
+                            }
+                        );
+                        for c in &p.call_sites {
+                            text.push_str(&format!(
+                                "  {}:{} ({}) args: [{}]\n",
+                                c.file,
+                                c.line,
+                                c.tier,
+                                c.args.join(", ")
+                            ));
+                        }
+                        if p.call_sites.is_empty() {
+                            text.push_str("  no resolved call sites\n");
+                        }
+                        let structured = json!({
+                            "name": p.name,
+                            "params": p.params,
+                            "call_sites": p.call_sites.iter().map(|c| json!({
+                                "file": c.file, "line": c.line, "tier": c.tier, "args": c.args,
+                            })).collect::<Vec<_>>(),
+                        });
+                        ToolOutput { text, structured }
+                    }
+                    None => ToolOutput {
+                        text: format!("no fn named \"{name}\"\n"),
+                        structured: json!({ "name": name, "found": false }),
+                    },
+                }
+            }
             "blast_radius" => {
                 let name = sarg("name").ok_or_else(|| anyhow::anyhow!("missing `name`"))?;
                 let affected = query::blast_radius(&store, &name)?;
@@ -969,6 +1011,33 @@ fn tools() -> Value {
             })
         ),
         tool(
+            "argument_provenance",
+            "A function's parameters and the raw source text of the arguments passed at every call site. Lexical evidence — what the code says, not what the values are.",
+            json!({
+                "name": { "type": "string", "description": "Exact fn name" },
+                "max_sites": { "type": "integer", "minimum": 1, "description": "Max call sites (default 20)" }
+            }),
+            json!(["name"]),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "params": { "type": "array", "items": { "type": "string" } },
+                    "call_sites": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "file": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "tier": { "type": "string" },
+                            "args": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["file", "line", "tier", "args"]
+                    }))
+                },
+                "required": ["name", "params", "call_sites"]
+            })
+        ),
+        tool(
             "blast_radius",
             "Everything that transitively calls this symbol through resolved edges — what a change here can reach.",
             json!({ "name": { "type": "string", "description": "Exact symbol name" } }),
@@ -1152,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_exactly_the_fourteen_tools() {
+    fn tools_list_exposes_exactly_the_fifteen_tools() {
         let (_d, server) = fixture();
         let resp = call(&server, 2, "tools/list", json!({}));
         let tools = resp["result"]["tools"].as_array().unwrap();
