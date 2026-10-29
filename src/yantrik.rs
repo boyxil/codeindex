@@ -38,6 +38,11 @@ pub struct Config {
     /// Multilingual embedder; the instance runs `client_only`, so the
     /// vectors always come from here.
     pub embed_model: String,
+    /// When set (`CODEINDEX_RERANK_MODEL`, e.g. a local instruct LLM),
+    /// semantic hits are re-ordered by this model before being returned.
+    /// A judgment layer, not a fact layer: tiers on the hits stay as the
+    /// resolver labelled them.
+    pub rerank_model: Option<String>,
 }
 
 impl Config {
@@ -83,6 +88,10 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "bge-m3".to_string()),
+            rerank_model: std::env::var("CODEINDEX_RERANK_MODEL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         })
     }
 }
@@ -178,6 +187,36 @@ fn valid_vector(vector: &[f32]) -> bool {
     }
     let norm_sq: f32 = vector.iter().map(|x| x * x).sum();
     norm_sq.is_finite() && norm_sq > 1e-6
+}
+
+/// Strip an optional `<think>…</think>` block (reasoning models).
+fn strip_think(content: &str) -> &str {
+    if content.starts_with("<think>") {
+        match content.find("</think>") {
+            Some(end) => content[end + "</think>".len()..].trim_start(),
+            None => content,
+        }
+    } else {
+        content
+    }
+}
+
+/// Indices from most to least relevant, as the reranker answered them.
+/// `None` on anything unparsable or out of range; duplicates dropped by
+/// the caller.
+fn parse_ranking(content: &str, len: usize) -> Option<Vec<usize>> {
+    let cleaned = strip_think(content);
+    let start = cleaned.find('[')?;
+    let end = start + cleaned[start..].find(']')?;
+    let nums: Option<Vec<usize>> = cleaned[start + 1..end]
+        .split(',')
+        .map(|s| s.trim().parse::<usize>().ok())
+        .collect();
+    let nums = nums?;
+    if nums.iter().any(|&i| i >= len) {
+        return None;
+    }
+    Some(nums)
 }
 
 /// The instance refuses a key whose claim was stored with a different
@@ -357,6 +396,11 @@ impl Client {
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Whether the reranker model is configured.
+    pub fn rerank_configured(&self) -> bool {
+        self.cfg.rerank_model.is_some()
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<Value> {
@@ -590,6 +634,87 @@ impl Client {
         }
         Ok(hits)
     }
+    /// One Ollama chat call asking the model to order the candidates by
+    /// relevance to the query. JSON-constrained, temperature 0.
+    fn chat_ranking(&self, query: &str, hits: &[Hit]) -> Result<Vec<usize>> {
+        let model = self
+            .cfg
+            .rerank_model
+            .as_deref()
+            .with_context(|| "rerank model not configured")?;
+        let listing: String = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let body = if h.signature.is_empty() {
+                    h.name.clone()
+                } else {
+                    format!("{} — {}", h.name, h.signature)
+                };
+                format!("[{}] ({} {}) {}", i, h.kind, h.file, body)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "You are a code search reranker. Order the search results by \
+             relevance to the query. The query may be in any language.\n\n\
+             Query: {query}\n\nResults:\n{listing}\n\n\
+             Reply with JSON only: {{\"ranking\": [indices from most relevant \
+             to least relevant, every index exactly once]}}"
+        );
+        let request = json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": false,
+            "format": "json",
+            "options": { "temperature": 0 },
+        });
+        let url = format!("{}/api/chat", self.cfg.embed_url);
+        let response = self
+            .transport
+            .request("POST", &url, "", Some(&request))
+            .map_err(|e| anyhow::anyhow!("reranker at {} failed: {e:#}", url))?;
+        let content = response
+            .pointer("/message/content")
+            .and_then(|v| v.as_str())
+            .with_context(|| "reranker response has no message.content")?
+            .to_string();
+        parse_ranking(&content, hits.len())
+            .with_context(|| format!("unparsable reranker output: {content:.200}"))
+    }
+
+    /// Re-order hits by the reranker's judgment. Infallible by design: a
+    /// missing model, a crashed call or garbage output all degrade to the
+    /// original order — reranking is a judgment layer, not a fact layer.
+    pub fn rerank_hits(&self, query: &str, hits: &[Hit]) -> Vec<Hit> {
+        let Some(_) = &self.cfg.rerank_model else {
+            return hits.to_vec();
+        };
+        if hits.len() < 2 {
+            return hits.to_vec();
+        }
+        match self.chat_ranking(query, hits) {
+            Ok(order) => {
+                let mut seen = std::collections::HashSet::new();
+                let mut out = Vec::with_capacity(hits.len());
+                for i in order {
+                    if i < hits.len() && seen.insert(i) {
+                        out.push(hits[i].clone());
+                    }
+                }
+                for (i, hit) in hits.iter().enumerate() {
+                    if !seen.contains(&i) {
+                        out.push(hit.clone());
+                    }
+                }
+                out
+            }
+            Err(e) => {
+                eprintln!("codeindex: reranking skipped — {e:#}");
+                hits.to_vec()
+            }
+        }
+    }
 }
 
 /// Semantic recall merged with exact lexical matches on the query text.
@@ -604,7 +729,14 @@ pub fn hybrid_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Hit>> {
-    let mut hits = client.recall(query, limit)?;
+    // With a reranker configured, fetch a wider buffer so the judgment
+    // pass has candidates beyond the final cut.
+    let recall_k = if client.rerank_configured() {
+        limit.saturating_mul(2).max(20)
+    } else {
+        limit
+    };
+    let mut hits = client.recall(query, recall_k)?;
     for symbol in store.search_symbols(query, None, None)? {
         if hits.len() >= limit {
             break;
@@ -625,6 +757,9 @@ pub fn hybrid_search(
             signature: String::new(),
         });
     }
+    let hits = client.rerank_hits(query, &hits);
+    let mut hits = hits;
+    hits.truncate(limit);
     Ok(hits)
 }
 
@@ -726,6 +861,8 @@ mod tests {
         batch_calls: Cell<usize>,
         embed_calls: Cell<usize>,
         unload_calls: Cell<usize>,
+        ranking: RefCell<Vec<usize>>, // what /api/chat answers
+        chat_calls: Cell<usize>,
         zero_embed_once: Cell<bool>,
         zero_embed_always: Cell<bool>,
         forgets: RefCell<Vec<String>>,
@@ -757,6 +894,14 @@ mod tests {
             _token: &str,
             body: Option<&Value>,
         ) -> Result<Value> {
+            if url.ends_with("/api/chat") {
+                self.state.chat_calls.set(self.state.chat_calls.get() + 1);
+                let order = self.state.ranking.borrow().clone();
+                let arr: Vec<Value> = order.iter().map(|i| json!(i)).collect();
+                return Ok(json!({
+                    "message": { "content": format!("{{\"ranking\": {}}}", json!(arr)) }
+                }));
+            }
             if url.ends_with("/api/generate") {
                 self.state
                     .unload_calls
@@ -860,6 +1005,7 @@ mod tests {
             domain: "code".into(),
             embed_url: "http://127.0.0.1:2".into(),
             embed_model: "test-embed".into(),
+            rerank_model: None,
         }
     }
 
@@ -895,6 +1041,92 @@ mod tests {
             "fn lex(src: &str) -> Vec<Token> {"
         );
         assert!(parse_marker("just a memory").is_none());
+    }
+
+    #[test]
+    fn rerank_reorders_when_configured() {
+        let (mock, state) = Mock::new();
+        state.ranking.borrow_mut().extend([1, 0]);
+        let cfg = Config {
+            rerank_model: Some("qwen3:8b".into()),
+            ..cfg()
+        };
+        let client = Client::with_transport(cfg, Box::new(mock));
+        let hits = vec![
+            Hit {
+                source: "semantic",
+                score: 0.9,
+                file: "a.rs".into(),
+                kind: "fn".into(),
+                name: "first".into(),
+                line: 1,
+                signature: String::new(),
+            },
+            Hit {
+                source: "semantic",
+                score: 0.5,
+                file: "b.rs".into(),
+                kind: "fn".into(),
+                name: "second".into(),
+                line: 2,
+                signature: String::new(),
+            },
+        ];
+        let out = client.rerank_hits("query", &hits);
+        assert_eq!(out[0].name, "second");
+        assert_eq!(out[1].name, "first");
+    }
+
+    #[test]
+    fn rerank_needs_configuration_and_tolerates_garbage() {
+        // Not configured: passthrough, no chat call.
+        let (mock, state) = Mock::new();
+        state.ranking.borrow_mut().extend([1, 0]);
+        let client = Client::with_transport(cfg(), Box::new(mock));
+        let hits = vec![Hit {
+            source: "semantic",
+            score: 0.5,
+            file: "a.rs".into(),
+            kind: "fn".into(),
+            name: "first".into(),
+            line: 1,
+            signature: String::new(),
+        }];
+        let out = client.rerank_hits("q", &hits);
+        assert_eq!(out.len(), 1);
+        assert_eq!(state.chat_calls.get(), 0);
+        // Configured but garbage ranking: out-of-range indices are
+        // dropped, hits keep the original (semantic) order.
+        let (mock2, state2) = Mock::new();
+        state2.ranking.borrow_mut().extend([99]);
+        let cfg = Config {
+            rerank_model: Some("m".into()),
+            ..cfg()
+        };
+        let client2 = Client::with_transport(cfg, Box::new(mock2));
+        let hits2 = vec![
+            Hit {
+                source: "semantic",
+                score: 0.5,
+                file: "a.rs".into(),
+                kind: "fn".into(),
+                name: "first".into(),
+                line: 1,
+                signature: String::new(),
+            },
+            Hit {
+                source: "semantic",
+                score: 0.4,
+                file: "b.rs".into(),
+                kind: "fn".into(),
+                name: "second".into(),
+                line: 2,
+                signature: String::new(),
+            },
+        ];
+        let out = client2.rerank_hits("q", &hits2);
+        let names: Vec<&str> = out.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["first", "second"], "{out:?}");
     }
 
     #[test]
