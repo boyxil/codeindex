@@ -792,13 +792,46 @@ pub struct FileOverview {
     pub path: String,
     pub symbols: usize,
     pub lines: i64,
+    /// Git state of the file, when the repo is a git checkout:
+    /// `modified`, `added`, `untracked`, …
+    pub git: Option<String>,
 }
 
-pub fn list_files(store: &Store) -> Result<Vec<FileOverview>> {
+fn git_annotations(root: &std::path::Path) -> HashMap<String, String> {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    let mut map = HashMap::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let (status, path) = line.split_at(line.len().min(2));
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let state = match status.trim() {
+            "M" | "MM" | "AM" => "modified",
+            "??" => "untracked",
+            "A" | "M " | "A " => "staged",
+            "D" => "deleted",
+            _ => "changed",
+        };
+        map.insert(path.trim_start_matches('"').to_string(), state.to_string());
+    }
+    map
+}
+
+pub fn list_files(store: &Store, root: &std::path::Path) -> Result<Vec<FileOverview>> {
+    let git = git_annotations(root);
     Ok(store
         .files_overview()?
         .into_iter()
         .map(|(path, symbols, lines)| FileOverview {
+            git: git.get(&path).cloned(),
             path,
             symbols,
             lines,
@@ -915,6 +948,39 @@ pub fn profile(store: &Store, root: &std::path::Path, name: &str) -> Result<Prof
         references: (refs.len(), by_kind),
         hierarchy: hierarchy(store, name)?,
     })
+}
+
+/// One fuzzy path match.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileMatch {
+    pub path: String,
+    pub symbols: usize,
+}
+
+/// Fuzzy path search over the indexed files: subsequence match on the
+/// normalized path (`-`/`_` equal, case-insensitive). Files whose
+/// basename contains the query whole come first.
+pub fn find_file(store: &Store, query: &str, limit: usize) -> Result<Vec<FileMatch>> {
+    let norm = |s: &str| s.to_lowercase().replace('-', "_");
+    let needle = norm(query);
+    let mut exact = Vec::new();
+    let mut contains = Vec::new();
+    let mut fuzzy = Vec::new();
+    for (path, symbols, _lines) in store.files_overview()? {
+        let p = norm(&path);
+        let base = p.rsplit('/').next().unwrap_or(&p).to_string();
+        if base == needle {
+            exact.push(FileMatch { path, symbols });
+        } else if base.contains(&needle) || p.contains(&format!("/{needle}")) {
+            contains.push(FileMatch { path, symbols });
+        } else if crate::store::subsequence(&needle, &p) {
+            fuzzy.push(FileMatch { path, symbols });
+        }
+    }
+    exact.truncate(limit);
+    contains.truncate(limit);
+    fuzzy.truncate(limit);
+    Ok(exact.into_iter().chain(contains).chain(fuzzy).collect())
 }
 
 /// A symbol's source slice (declaration line through the closing brace
@@ -1242,7 +1308,7 @@ mod tests {
         crate::index(dir.path()).unwrap();
         let store = Store::open(&dir.path().join(".codeindex/index.db")).unwrap();
 
-        let files = list_files(&store).unwrap();
+        let files = list_files(&store, dir.path()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].symbols, 1);
 

@@ -585,7 +585,7 @@ impl McpServer {
                 }
             }
             "list_files" => {
-                let files = query::list_files(&store)?;
+                let files = query::list_files(&store, &self.root)?;
                 let mut text = format!("{} indexed file(s):\n", files.len());
                 for f in &files {
                     text.push_str(&format!(

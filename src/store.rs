@@ -947,21 +947,40 @@ impl Store {
         kind: Option<&str>,
         path: Option<&str>,
     ) -> Result<Vec<IndexedSymbol>> {
-        // `*`/`?` switch to glob matching on the name (case-sensitive:
-        // patterns describe code); otherwise substring, case-insensitive.
+        // `*`/`?` switch to glob matching on the name. Smart-case: an
+        // uppercase letter in the query makes matching case-sensitive.
         let glob = query.contains('*') || query.contains('?');
-        let needle = query.to_lowercase();
+        let case_sensitive = query.chars().any(|c| c.is_uppercase());
         let matches = |name: &str| {
             if glob {
                 glob_match(query, name)
+            } else if case_sensitive {
+                name.contains(query)
             } else {
-                name.to_lowercase().contains(&needle)
+                name.to_lowercase().contains(&query.to_lowercase())
             }
         };
         Ok(self
             .symbols()?
             .into_iter()
             .filter(|s| matches(&s.name))
+            .filter(|s| kind.is_none_or(|k| s.kind == k))
+            .filter(|s| path.is_none_or(|p| s.file.contains(p)))
+            .collect())
+    }
+
+    /// Subsequence match on the name, case-insensitive: `lxc` finds
+    /// `lex`. The fallback stage of a staged search.
+    pub fn fuzzy_symbols(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<Vec<IndexedSymbol>> {
+        Ok(self
+            .symbols()?
+            .into_iter()
+            .filter(|s| subsequence(query, &s.name))
             .filter(|s| kind.is_none_or(|k| s.kind == k))
             .filter(|s| path.is_none_or(|p| s.file.contains(p)))
             .collect())
@@ -1152,6 +1171,26 @@ fn row_to_call_ref(r: &rusqlite::Row<'_>) -> rusqlite::Result<CallRef> {
         reason: r.get(5)?,
         external_crate: r.get(6)?,
     })
+}
+
+/// Every char of `needle` appears in `haystack` in order.
+pub(crate) fn subsequence(needle: &str, haystack: &str) -> bool {
+    let n: Vec<char> = needle.to_lowercase().chars().collect();
+    let h: Vec<char> = haystack.to_lowercase().chars().collect();
+    let mut hi = 0usize;
+    for c in &n {
+        loop {
+            if hi >= h.len() {
+                return false;
+            }
+            if h[hi] == *c {
+                hi += 1;
+                break;
+            }
+            hi += 1;
+        }
+    }
+    true
 }
 
 fn encode_vector(vector: &[f32]) -> Vec<u8> {
@@ -1424,8 +1463,12 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let hits = store.search_symbols("ALP", None, None).unwrap();
+        // Smart-case: lowercase query matches case-insensitively.
+        let hits = store.search_symbols("alp", None, None).unwrap();
         assert_eq!(hits.len(), 2);
+        // Uppercase query matches case-sensitively — only "Alpha".
+        let hits = store.search_symbols("Alp", None, None).unwrap();
+        assert_eq!(hits.len(), 1);
         // Glob patterns match the whole name, case-sensitively.
         assert_eq!(store.search_symbols("Al*", None, None).unwrap().len(), 1);
         assert_eq!(store.search_symbols("*pha", None, None).unwrap().len(), 1);

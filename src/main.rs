@@ -864,7 +864,7 @@ fn main() -> Result<()> {
         }
         Command::Files { path } => {
             let store = open(&path)?;
-            let files = query::list_files(&store)?;
+            let files = query::list_files(&store, &path)?;
             emit(
                 json_mode,
                 json!({
