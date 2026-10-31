@@ -216,6 +216,19 @@ enum Command {
         /// Indexed repository root.
         path: PathBuf,
     },
+    /// Poll for file changes and re-index automatically.
+    /// Keeps the local index and the semantic layer current without
+    /// running `index` manually. Press Ctrl+C to stop.
+    Watch {
+        /// Repository root.
+        path: PathBuf,
+        /// Poll interval in seconds.
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+        /// Keep the YantrikDB semantic layer in sync (CODEINDEX_YANTRIK_URL).
+        #[arg(long)]
+        semantic: bool,
+    },
     /// Serve the index over MCP (stdio, JSON-RPC 2.0).
     Serve {
         /// Repository root, indexed at startup.
@@ -968,6 +981,44 @@ fn main() -> Result<()> {
                     "extractor_version": codeindex::store::EXTRACTOR_VERSION,
                 }))?
             );
+        }
+        Command::Watch {
+            path,
+            interval,
+            semantic,
+        } => {
+            let dur = std::time::Duration::from_secs(interval);
+            eprintln!(
+                "codeindex watch: {} — poll every {}s, semantic: {}",
+                path.display(),
+                interval,
+                if semantic { "on" } else { "off" }
+            );
+            loop {
+                match codeindex::index(&path) {
+                    Ok(stats) => {
+                        if stats.parsed > 0 {
+                            eprintln!(
+                                "codeindex: {} parsed, {} symbols, {} edges ({} resolved)",
+                                stats.parsed, stats.symbols, stats.edges, stats.resolved
+                            );
+                            if semantic {
+                                let store = open(&path)?;
+                                let client = yantrik_client(&path)?;
+                                match codeindex::yantrik::sync(&store, &client) {
+                                    Ok(sync) => eprintln!(
+                                        "codeindex: semantic sync — {} pushed, {} forgotten",
+                                        sync.pushed, sync.forgotten
+                                    ),
+                                    Err(e) => eprintln!("codeindex: semantic sync skipped — {e:#}"),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("codeindex: index error — {e:#}"),
+                }
+                std::thread::sleep(dur);
+            }
         }
         Command::Serve {
             path,
